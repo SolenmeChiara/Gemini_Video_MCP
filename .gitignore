@@ -1,0 +1,41 @@
+# 绝不提交密钥 / secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# 内部开发文档，不随开源仓库发布 / internal dev notes, not published
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境 / virtualenvs
+.venv/
+venv/
+
+# uv
+# （uv.lock 要提交，此处不忽略 / uv.lock IS tracked — do not ignore it）
+
+# 远程文件通道的临时目录（下载/上传的文件用完即删，绝不提交）
+# temp dir for downloaded/uploaded media — always ephemeral, never committed
+temp_media/
+
+# 工具缓存 / tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# 编辑器 / editors
+.vscode/
+.idea/
+
+# 系统杂项 / OS cruft
+.DS_Store
+Thumbs.db
+
+# 日志 / logs
+*.log
