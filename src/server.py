@@ -579,7 +579,7 @@ async def describe_video(
     persona: str | None = None,
     hint: str | None = None,
     low_resolution: bool = False,
-    max_output_tokens: int = 8192,
+    max_output_tokens: int = 30000,
 ) -> str:
     """把本地视频交给 Gemini 直传识别，返回按时间轴分段的详细内容描述（画面 + 音轨）。
 
@@ -597,7 +597,7 @@ async def describe_video(
             仅在未提供 prompt 时生效。
         low_resolution: 低清模式。开启后约 100 token/秒（标清约 300 token/秒），长视频省钱，
             但画面细节会变粗。默认关闭。
-        max_output_tokens: 最大输出 token 数，默认 8192。内部有 2048 的下限保护
+        max_output_tokens: 最大输出 token 数，默认 30000。内部有 2048 的下限保护
             （Gemini 的“思考”token 也计入这里；默认思考等级为 high，思考会占用
             数千 token，太小会把正文挤没。思考等级可用环境变量 GEMINI_THINKING_LEVEL 调整）。
 
@@ -666,7 +666,7 @@ async def describe_video_url(
     persona: str | None = None,
     hint: str | None = None,
     low_resolution: bool = False,
-    max_output_tokens: int = 8192,
+    max_output_tokens: int = 30000,
 ) -> str:
     """从【网络直链】下载、或从【YouTube 视频页】云端直读视频再交给 Gemini 识别，返回按时间轴分段的中文描述。
 
@@ -688,7 +688,7 @@ async def describe_video_url(
         persona: 可选人设，仅在未传 prompt 时生效。
         hint: 可选前置线索，仅在未传 prompt 时生效。
         low_resolution: 低清省钱开关，默认关闭。
-        max_output_tokens: 最大输出 token，默认 8192（内部有 2048 下限保护）。
+        max_output_tokens: 最大输出 token，默认 30000（内部有 2048 下限保护）。
 
     Returns:
         Gemini 生成的视频描述文本（末尾可能带用量统计或截断提示）。
