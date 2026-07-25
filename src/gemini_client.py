@@ -502,3 +502,72 @@ class GeminiVideoClient:
         finally:
             if uploaded_file_name:
                 await self._delete_file(uploaded_file_name)
+
+    async def describe_youtube(
+        self,
+        youtube_url: str,
+        prompt: str,
+        *,
+        low_resolution: bool = False,
+        max_output_tokens: int = 4096,
+        thinking_level: str = THINKING_LEVEL_MINIMAL,
+    ) -> dict[str, Any]:
+        """把 YouTube 视频页链接交给 Gemini 云端直读并返回描述（不下载、不走 Files API）。
+
+        Gemini 原生支持在 parts 里放 {"file_data": {"file_uri": "<YouTube 视频页 URL>"}}，
+        由 Gemini 服务端自行拉取该 YouTube 视频，本地无需下载、也不占用 Files API 存储。
+        注意这条通道的 file_data 【不带 mime_type】（与本地大文件的 file_data 不同，那边要带）。
+        仅支持公开视频；免费层对 YouTube 每天有总时长限额。
+
+        参数与返回结构均与 describe_video 保持一致，唯一区别是 channel 固定为 "youtube"，
+        且没有 inline / files_api 之分（因此也没有远端文件需要清理）。
+
+        Returns:
+            dict: {
+                "text": 描述正文,
+                "usage": {"prompt_tokens", "output_tokens", "total_tokens"} 或 None,
+                "finish_reason": Gemini 的 finishReason 或 None,
+                "truncated": 是否因 MAX_TOKENS 被截断（bool）,
+                "channel": "youtube",
+            }
+        """
+        # YouTube 直读：file_data 只放 file_uri，不带 mime_type（Gemini 服务端自行识别）。
+        video_part: dict[str, Any] = {"file_data": {"file_uri": youtube_url}}
+
+        generation_config = _build_generation_config(
+            max_output_tokens=max_output_tokens,
+            thinking_level=thinking_level,
+            model_identifier=self.model,
+            low_resolution=low_resolution,
+        )
+
+        request_data = {
+            "contents": [{"role": "user", "parts": [video_part, {"text": prompt}]}],
+            "generationConfig": generation_config,
+            "safetySettings": GEMINI_SAFETY_SETTINGS,
+        }
+
+        endpoint = f"models/{self.model}:generateContent"
+        response_data = await self._request_json("POST", endpoint, request_data)
+        text, usage_record, finish_reason = _parse_normal_response(response_data)
+
+        truncated = finish_reason == "MAX_TOKENS"
+        if truncated:
+            # 截断检测：思考 token 计入 maxOutputTokens，思考太多会把可见输出挤掉。
+            logger.warning("[%s] YouTube 视频描述被 maxOutputTokens 截断（思考 token 也计入上限）", self.model)
+
+        usage_dict = None
+        if usage_record:
+            usage_dict = {
+                "prompt_tokens": usage_record[0],
+                "output_tokens": usage_record[1],
+                "total_tokens": usage_record[2],
+            }
+
+        return {
+            "text": text,
+            "usage": usage_dict,
+            "finish_reason": finish_reason,
+            "truncated": truncated,
+            "channel": "youtube",
+        }

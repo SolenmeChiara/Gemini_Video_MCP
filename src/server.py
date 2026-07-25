@@ -127,7 +127,7 @@ _VIEW_MAX_DIMENSION = 4096
 # 默认提示词
 # ---------------------------------------------------------------------------
 # 源自 MoFox-Bot 的 batch_analysis_prompt（sol 亲测“效果好到浮夸”的那版），
-# 有意【不】加任何压制文风的措辞（不禁止抒情、不要求客观简洁），保留 Gemini 自由发挥的戏剧张力。
+# 有意【不】加任何压制文风的措辞（不禁止抒情、不要求客观简洁，只要求其不要胡编乱造），保留 Gemini 自由发挥的戏剧张力。
 # 原文两处重复的编号“6.”这里顺手改成 6 / 7；两行人设占位符改由 persona 参数按需插入。
 
 _DEFAULT_PROMPT_HEAD = (
@@ -197,6 +197,51 @@ def _validate_local_file(path: str) -> tuple[Path | None, str | None]:
 # ---------------------------------------------------------------------------
 
 
+def _build_final_prompt_and_tokens(
+    prompt: str | None,
+    persona: str | None,
+    hint: str | None,
+    max_output_tokens: int,
+) -> tuple[str, int]:
+    """把 prompt/persona/hint 组装成最终提示词，并把 max_output_tokens 归一化到下限之上。
+
+    本地文件、直链下载、YouTube 直读三条入口都共用这一段，确保提示词组装（prompt 优先，
+    其次 persona/hint 版默认模板）与输出 token 下限保护完全一致、不漂移。
+    """
+    # 组装提示词（prompt 优先，其次 persona/hint 版默认模板）
+    final_prompt = prompt.strip() if prompt and prompt.strip() else _build_default_prompt(persona, hint)
+
+    # 输出 token 下限保护（思考 token 也计入此上限，太小会把正文挤没）
+    try:
+        tokens = int(max_output_tokens)
+    except (TypeError, ValueError):
+        tokens = 4096
+    effective_tokens = max(tokens, _MIN_OUTPUT_TOKENS)
+    return final_prompt, effective_tokens
+
+
+def _format_describe_result(result: dict) -> str:
+    """把 Gemini 识别结果 dict 拼成最终返回文本（正文 + 末尾用量/截断页脚）。
+
+    本地文件、直链下载、YouTube 直读三条入口都共用这一段，保证页脚格式与措辞一致。
+    """
+    text = result["text"]
+    footer_lines: list[str] = []
+    if result.get("truncated"):
+        footer_lines.append(
+            "⚠️ 提示：描述可能被输出长度上限截断了。可调大 max_output_tokens（如 8192）后重试以获得完整内容。"
+        )
+    usage = result.get("usage")
+    if usage:
+        footer_lines.append(
+            f"（用量：输入 {usage['prompt_tokens']:,} token，输出 {usage['output_tokens']:,} token，"
+            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}）"
+        )
+    if footer_lines:
+        text = text + "\n\n---\n" + "\n".join(footer_lines)
+    return text
+
+
 async def _describe_video_bytes(
     video_bytes: bytes,
     mime_type: str,
@@ -213,15 +258,7 @@ async def _describe_video_bytes(
     提示词组装、思考等级自动降级重试、用量/截断页脚逻辑完全一致、不漂移。
     调用方需自行保证：API key 已存在、video_bytes 非空、mime_type 已判定。
     """
-    # 组装提示词（prompt 优先，其次 persona/hint 版默认模板）
-    final_prompt = prompt.strip() if prompt and prompt.strip() else _build_default_prompt(persona, hint)
-
-    # 输出 token 下限保护（思考 token 也计入此上限，太小会把正文挤没）
-    try:
-        tokens = int(max_output_tokens)
-    except (TypeError, ValueError):
-        tokens = 4096
-    effective_tokens = max(tokens, _MIN_OUTPUT_TOKENS)
+    final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
 
     client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
     try:
@@ -253,22 +290,56 @@ async def _describe_video_bytes(
         logger.exception("视频识别管线未预期异常")
         return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
 
-    # 组装返回文本
-    text = result["text"]
-    footer_lines: list[str] = []
-    if result.get("truncated"):
-        footer_lines.append(
-            "⚠️ 提示：描述可能被输出长度上限截断了。可调大 max_output_tokens（如 8192）后重试以获得完整内容。"
-        )
-    usage = result.get("usage")
-    if usage:
-        footer_lines.append(
-            f"（用量：输入 {usage['prompt_tokens']:,} token，输出 {usage['output_tokens']:,} token，"
-            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}）"
-        )
-    if footer_lines:
-        text = text + "\n\n---\n" + "\n".join(footer_lines)
-    return text
+    return _format_describe_result(result)
+
+
+async def _describe_youtube_url(
+    youtube_url: str,
+    *,
+    prompt: str | None,
+    persona: str | None,
+    hint: str | None,
+    low_resolution: bool,
+    max_output_tokens: int,
+) -> str:
+    """YouTube 视频页直读的共享核心：组装提示词、调用 Gemini 云端直读、拼装中文返回文本。
+
+    与 _describe_video_bytes 走同一套提示词组装（_build_final_prompt_and_tokens）、思考等级自动
+    降级重试、返回格式化（_format_describe_result），唯一区别是底层换成 client.describe_youtube
+    （file_data 直传 file_uri、服务器不下载、通道标 "youtube"），因此也没有临时文件需要清理。
+    调用方需自行保证：API key 已存在、youtube_url 已判定为 YouTube 链接。
+    """
+    final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
+
+    client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+    try:
+        try:
+            result = await client.describe_youtube(
+                youtube_url,
+                final_prompt,
+                low_resolution=low_resolution,
+                max_output_tokens=effective_tokens,
+                thinking_level=GEMINI_THINKING_LEVEL,
+            )
+        except GeminiVideoError as e:
+            # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
+            if "thinking level" not in str(e).lower():
+                raise
+            logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", GEMINI_MODEL, GEMINI_THINKING_LEVEL)
+            result = await client.describe_youtube(
+                youtube_url,
+                final_prompt,
+                low_resolution=low_resolution,
+                max_output_tokens=effective_tokens,
+                thinking_level="low",
+            )
+    except GeminiVideoError as e:
+        return f"视频识别失败：{e}"
+    except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
+        logger.exception("YouTube 视频识别管线未预期异常")
+        return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
+
+    return _format_describe_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +535,39 @@ async def _download_to_temp(url: str) -> tuple[Path | None, str | None, str | No
 
 
 # ---------------------------------------------------------------------------
+# YouTube 视频页判定（describe_video_url 的分流开关）
+# ---------------------------------------------------------------------------
+# Gemini API 原生支持直读 YouTube 视频页（file_data.file_uri 直传、云端拉取、不下载）。
+# 命中这些主机名就走 describe_youtube 直读，不再尝试当直链下载。
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+
+
+def _is_youtube_url(url: str) -> bool:
+    """判断 url 是否是 YouTube 视频页链接（对 netloc 做精确白名单比对，大小写不敏感）。
+
+    刻意用 urlparse 取出 netloc 再精确匹配，而不是子串包含——避免 evil.com/?u=youtube.com、
+    youtube.com.evil.net 这类把 youtube 藏在别处的链接被误判成 YouTube。
+    """
+    try:
+        netloc = urlparse((url or "").strip()).netloc.lower()
+    except (ValueError, TypeError):
+        return False
+    # 剥掉可能存在的用户信息与端口（正常 YouTube 页面没有，稳妥起见仍处理）。
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    if ":" in netloc:
+        netloc = netloc.split(":", 1)[0]
+    return netloc in _YOUTUBE_HOSTS
+
+
+# ---------------------------------------------------------------------------
 # 工具 1：describe_video（主工具，本地视频）
 # ---------------------------------------------------------------------------
 
@@ -564,18 +668,22 @@ async def describe_video_url(
     low_resolution: bool = False,
     max_output_tokens: int = 8192,
 ) -> str:
-    """从【网络直链】下载视频再交给 Gemini 识别，返回按时间轴分段的中文描述。
+    """从【网络直链】下载、或从【YouTube 视频页】云端直读视频再交给 Gemini 识别，返回按时间轴分段的中文描述。
 
-    适用于：视频不在本机，但你有一个“点开就是视频本体”的直接下载链接（以 .mp4/.mov/.webm 等结尾）。
-    下载的文件会存到服务器 temp_media/ 临时目录，识别完就删掉。
+    两种输入都支持：
+    - 视频文件直链（以 .mp4/.mov/.webm 等结尾、点开就是视频本体）：下载到服务器 temp_media/ 临时目录，
+      识别完就删掉。
+    - ✅ YouTube 视频页链接（youtube.com/watch、youtu.be 短链、shorts 等）可以直接传，服务器不下载、
+      由 Gemini 云端直读；仅支持公开视频（私享/会员/年龄限制的不行），免费层每天有 YouTube 总时长限额，
+      长视频照常按秒计费。
 
-    ⚠️ 只支持【视频文件直链】。视频网站的播放【页面】链接（B站/抖音/TikTok/YouTube 等）不是直链、
-       无法解析（那需要 yt-dlp 之类工具，本服务器暂不支持）。若链接打开是网页而非视频文件，会明确报错。
+    ⚠️ B站/抖音/TikTok 等其他平台页面仍不支持（那需要 yt-dlp 之类工具，本服务器暂不支持）。
+       若给的是这类平台页面链接、或链接打开是网页而非视频文件，会明确报错。
 
     其余参数（prompt/persona/hint/low_resolution/max_output_tokens）含义与 describe_video 完全一致。
 
     Args:
-        url: 视频文件的 http/https 直链。
+        url: 视频文件的 http/https 直链，或 YouTube 视频页链接（youtube.com/watch、youtu.be、shorts）。
         prompt: 自定义提示词，传了就完全覆盖默认模板（此时 persona/hint 被忽略）。
         persona: 可选人设，仅在未传 prompt 时生效。
         hint: 可选前置线索，仅在未传 prompt 时生效。
@@ -590,6 +698,18 @@ async def describe_video_url(
         return err
     if not url or not url.strip():
         return "没有提供链接。请把视频文件的 http/https 直链传给 url 参数。"
+
+    # YouTube 视频页：走 Gemini 云端直读通道（file_data.file_uri 直传，服务器不下载）。
+    # _describe_youtube_url 内部已兜住所有异常、绝不裸抛出 MCP 边界。
+    if _is_youtube_url(url):
+        return await _describe_youtube_url(
+            url.strip(),
+            prompt=prompt,
+            persona=persona,
+            hint=hint,
+            low_resolution=low_resolution,
+            max_output_tokens=max_output_tokens,
+        )
 
     temp_path, mime_type, err = await _download_to_temp(url.strip())
     if err:
