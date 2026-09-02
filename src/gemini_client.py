@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,10 @@ VIDEO_INLINE_LIMIT_BYTES = 14 * 1024 * 1024
 
 # Files API 单文件上限（免费层存储上限 2GB；文件 48 小时后自动清理）。
 FILES_API_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+# Interactions API 端点（相对 base_url）：agentic 视频处理走这里，
+# 由模型自己决定看哪一段、用什么帧率、要不要听音轨，长视频能省下大量媒体 token。
+INTERACTIONS_ENDPOINT = "interactions"
 
 # 思考等级：Gemini 3.5 系列新增 "minimal"；感知型任务（看视频）用最低思考即可。
 THINKING_LEVEL_MINIMAL = "minimal"
@@ -203,6 +208,141 @@ def _parse_normal_response(response_data: dict) -> tuple[str, tuple[int, int, in
         )
 
     return text, usage_record, finish_reason
+
+
+def _normalize_usage(raw: dict | None) -> dict[str, int] | None:
+    """把各种写法的用量字段归一成 {prompt_tokens, output_tokens, total_tokens}。
+
+    generateContent 用 promptTokenCount/candidatesTokenCount/totalTokenCount；
+    Interactions API 用 usage.input_tokens/output_tokens/total_tokens（也可能是 camelCase），
+    这里一并兼容，取不到的字段按 0 计。
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def pick(*keys: str) -> int:
+        for k in keys:
+            v = raw.get(k)
+            if isinstance(v, (int, float)):
+                return int(v)
+        return 0
+
+    prompt_tokens = pick("promptTokenCount", "prompt_tokens", "promptTokens", "input_tokens", "inputTokens")
+    output_tokens = pick(
+        "candidatesTokenCount", "candidates_tokens", "output_tokens", "outputTokens", "completion_tokens"
+    )
+    total_tokens = pick("totalTokenCount", "total_tokens", "totalTokens")
+    if not total_tokens:
+        total_tokens = prompt_tokens + output_tokens
+    if not (prompt_tokens or output_tokens or total_tokens):
+        return None
+    return {"prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
+
+
+# Interactions 的 steps 里，这几种条目才是"给人看的正文"。
+_INTERACTION_OUTPUT_TYPES = ("model_output", "text", "output_text", "message")
+# 这几种是模型自己干活的痕迹（取帧、听音轨、思考），不能混进正文。
+_INTERACTION_WORK_TYPES = ("processing_call", "processing_result")
+
+
+def _extract_interaction_text(response_data: dict) -> str:
+    """从 Interactions API 的响应里取出正文。
+
+    首选顶层 output_text（SDK 里的 interaction.output_text）。实测 REST 响应没有这个字段，
+    正文散在 steps 里，形如：
+        processing_call / processing_result（模型去取某几秒的帧或音轨）
+        thought（思考，只有签名没有文本）
+        model_output（说话）
+    agentic 是 Think→Act→Observe 的循环，中途的 model_output 常常是"我还得再听一段"这类
+    自言自语，随后它又去取了新素材——那种话已被后续动作推翻，不该出现在给用户的描述里。
+    所以这里【从后往前】收集：遇到 model_output 就收，遇到 thought 跳过（正文可能被思考切成几段），
+    一旦遇到取素材的动作就停——只保留最后一次取素材之后说的话。
+    """
+    for key in ("output_text", "outputText"):
+        value = response_data.get(key)
+        if isinstance(value, str) and value.strip():
+            return _strip_thought_marker(value)
+
+    steps = None
+    for container_key in ("steps", "output", "outputs"):
+        candidate = response_data.get(container_key)
+        if isinstance(candidate, list) and candidate:
+            steps = candidate
+            break
+    if not steps:
+        return ""
+
+    tail: list[dict] = []
+    for item in reversed(steps):
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in _INTERACTION_OUTPUT_TYPES:
+            tail.append(item)
+        elif item_type in _INTERACTION_WORK_TYPES and tail:
+            break
+        # thought 之类的：不收也不打断（正文可能被思考步骤切开）
+    tail.reverse()
+
+    chunks: list[str] = []
+
+    def collect(item: Any) -> None:
+        if not isinstance(item, dict) or item.get("thought"):
+            return
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            chunks.append(text)
+            return
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            chunks.append(content)
+            return
+        if isinstance(content, list):
+            for sub in content:
+                if isinstance(sub, dict) and str(sub.get("type") or "text") in _INTERACTION_OUTPUT_TYPES:
+                    collect(sub)
+
+    for item in tail:
+        collect(item)
+
+    return _strip_thought_marker("".join(chunks))
+
+
+def _strip_thought_marker(text: str) -> str:
+    """去掉正文开头漏出来的 "thought" 标记词。
+
+    实测 gemini-3.8-flash 走 Interactions 时，最后一条 model_output 的文本偶尔以裸的
+    "thought " 开头（思考段的类型标记被一起序列化进了文本）。只在正文最开头、且后面还有内容时才去掉。
+    """
+    stripped = (text or "").strip()
+    match = re.match(r"^thought[\s：:]+(?=\S)", stripped, flags=re.IGNORECASE)
+    if match:
+        return stripped[match.end() :].strip()
+    return stripped
+
+
+def _normalize_interaction_usage(raw: dict | None) -> dict[str, int] | None:
+    """把 Interactions API 的 usage 折算成与 generateContent 一致的三个数。
+
+    实测字段：total_tokens / total_input_tokens / total_output_tokens /
+    total_tool_use_tokens（agentic 自己取的帧与音轨，按输入计费）/ total_thought_tokens。
+    所以「输入」= 提示词 + 它自己取回来的媒体，这才是 agentic 真正花掉的大头。
+    """
+    if not isinstance(raw, dict):
+        return None
+    if "total_tokens" not in raw and "total_input_tokens" not in raw:
+        return _normalize_usage(raw)
+
+    def num(key: str) -> int:
+        value = raw.get(key)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    prompt_tokens = num("total_input_tokens") + num("total_tool_use_tokens")
+    output_tokens = num("total_output_tokens")
+    total_tokens = num("total_tokens") or (prompt_tokens + output_tokens + num("total_thought_tokens"))
+    if not (prompt_tokens or output_tokens or total_tokens):
+        return None
+    return {"prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
 
 
 class GeminiVideoClient:
@@ -404,6 +544,33 @@ class GeminiVideoClient:
 
             return file_uri, file_name
 
+    async def upload_video(
+        self, data: bytes, mime_type: str, display_name: str = "gemini_video_mcp"
+    ) -> tuple[str, str]:
+        """公开包装：把字节上传到 Files API 并等到 ACTIVE，返回 (file_uri, file_name)。
+
+        上层（server 的上传缓存）需要自己掌握上传时机与远端文件的生命周期，所以把内部方法开出来。
+        注意：这条路径【不】负责删除远端文件，删不删由调用方决定（Google 侧 48 小时后自动清理）。
+        """
+        return await self._upload_file_and_wait_active(data, mime_type, display_name)
+
+    async def get_file_info(self, file_name: str) -> dict | None:
+        """查询 Files API 上某个文件的元信息（state / expirationTime 等）；查不到或出错返回 None。
+
+        给上传缓存做复用前的校验：state 必须是 ACTIVE，且没到过期时间。
+        """
+        if not file_name:
+            return None
+        try:
+            return await self._request_json("GET", file_name)
+        except Exception as e:  # noqa: BLE001 - 查不到就当缓存失效，不该把异常抛给用户
+            logger.debug("查询 Files API 文件信息失败（当作缓存失效）：%s", e)
+            return None
+
+    async def delete_file(self, file_name: str) -> None:
+        """公开包装：尽力删除 Files API 上的文件（失败不抛）。"""
+        await self._delete_file(file_name)
+
     async def _delete_file(self, file_name: str) -> None:
         """删除 Files API 上的文件（尽力而为，失败不抛——文件 48 小时后也会自动清理）。"""
         try:
@@ -426,11 +593,17 @@ class GeminiVideoClient:
         max_output_tokens: int = 4096,
         low_resolution: bool = False,
         thinking_level: str = THINKING_LEVEL_MINIMAL,
+        file_uri: str | None = None,
+        video_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """把整个视频（含音轨）直接交给 Gemini 分析并返回描述。
 
         - 小视频（<= 14MB）走 inline_data，单次请求完成；
         - 大视频走 Files API：上传 -> 等待 ACTIVE -> 生成 -> 尽力删除远端文件；
+        - 调用方已经自己上传好（如 server 侧的上传缓存）时传 file_uri：直接引用该远端文件，
+          既不再上传、也【不】删除它（生命周期归调用方管），此时 video_bytes 可以传空字节；
+        - video_metadata：只看视频的一段/换抽帧率时传，形如
+          {"start_offset": "39s", "end_offset": "46s", "fps": 5}，原样塞进这个 part；
         - low_resolution=True 时用低媒体分辨率（约 100 token/秒 vs 标清约 300 token/秒）。
 
         Returns:
@@ -442,7 +615,7 @@ class GeminiVideoClient:
                 "channel": "inline" 或 "files_api",
             }
         """
-        if len(video_bytes) > FILES_API_LIMIT_BYTES:
+        if not file_uri and len(video_bytes) > FILES_API_LIMIT_BYTES:
             raise GeminiVideoError(
                 f"文件太大（{len(video_bytes) / 1024 / 1024 / 1024:.2f}GB），"
                 f"超过了 Gemini Files API 的单文件上限（2GB）。请先裁短或压缩视频。"
@@ -450,16 +623,22 @@ class GeminiVideoClient:
 
         uploaded_file_name: str | None = None
 
-        if len(video_bytes) <= VIDEO_INLINE_LIMIT_BYTES:
+        if file_uri:
+            # 调用方（上传缓存）已经把文件放上去了：直接引用，不上传也不删除。
+            channel = "files_api"
+            video_part: dict[str, Any] = {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
+        elif len(video_bytes) <= VIDEO_INLINE_LIMIT_BYTES:
             channel = "inline"
-            video_part: dict[str, Any] = {
-                "inline_data": {"mime_type": mime_type, "data": base64.b64encode(video_bytes).decode()}
-            }
+            video_part = {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(video_bytes).decode()}}
         else:
             channel = "files_api"
             logger.info("视频大小 %.1fMB 超过内联上限，改走 Files API 上传", len(video_bytes) / 1024 / 1024)
-            file_uri, uploaded_file_name = await self._upload_file_and_wait_active(video_bytes, mime_type)
-            video_part = {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
+            uploaded_uri, uploaded_file_name = await self._upload_file_and_wait_active(video_bytes, mime_type)
+            video_part = {"file_data": {"mime_type": mime_type, "file_uri": uploaded_uri}}
+
+        # 只看某一段 / 换抽帧率：videoMetadata 挂在视频这个 part 上。
+        if video_metadata:
+            video_part["video_metadata"] = dict(video_metadata)
 
         generation_config = _build_generation_config(
             max_output_tokens=max_output_tokens,
@@ -570,4 +749,64 @@ class GeminiVideoClient:
             "finish_reason": finish_reason,
             "truncated": truncated,
             "channel": "youtube",
+        }
+
+    # ---- Interactions API：agentic 视频理解 ----
+
+    async def describe_video_agentic(
+        self,
+        *,
+        prompt: str,
+        file_uri: str,
+        mime_type: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """走 Interactions API 的 agentic 模式识别视频（模型自行决定看哪段、什么帧率、要不要听音轨）。
+
+        与 generateContent 的静态通道（默认 1 FPS 全程抽帧）相比，长视频能省下大量媒体 token；
+        官方指南建议 5 分钟以内的短片、或需要逐帧全程描述时仍用静态。
+
+        Args:
+            prompt: 提示词（按官方示例放在视频【之后】）。
+            file_uri: 视频地址——Files API 上传后拿到的 uri，或公开的 YouTube 视频页链接。
+            mime_type: 视频 MIME；YouTube 链接不要传（服务端自行识别）。
+            model: 覆盖本客户端的默认模型（agentic 不是所有模型都支持，可单独指定）。
+
+        Returns:
+            与 describe_video 同构的 dict，channel 固定为 "interactions"，
+            另外多一个 "model" 字段标出这次实际用的模型。
+
+        Raises:
+            GeminiVideoError: 端点不可用、模型不支持 agentic、或响应里找不到正文时。
+        """
+        used_model = (model or self.model).strip()
+
+        video_input: dict[str, Any] = {"type": "video", "uri": file_uri, "processing": "agentic"}
+        if mime_type:
+            video_input["mime_type"] = mime_type
+
+        request_data = {
+            "model": used_model,
+            "input": [video_input, {"type": "text", "text": prompt}],
+        }
+
+        response_data = await self._request_json("POST", INTERACTIONS_ENDPOINT, request_data)
+
+        text = _extract_interaction_text(response_data)
+        if not text:
+            top_keys = ", ".join(sorted(response_data.keys())) if isinstance(response_data, dict) else "（非对象响应）"
+            raise GeminiVideoError(
+                "Interactions API（agentic 模式）返回的结果里找不到正文文本。"
+                f"\n响应顶层字段：{top_keys}"
+            )
+
+        usage_dict = _normalize_interaction_usage(response_data.get("usage") or response_data.get("usageMetadata"))
+
+        return {
+            "text": text,
+            "usage": usage_dict,
+            "finish_reason": response_data.get("finish_reason") or response_data.get("status"),
+            "truncated": False,
+            "channel": "interactions",
+            "model": used_model,
         }

@@ -22,12 +22,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -36,6 +39,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
 from .config import (
+    GEMINI_AGENTIC_MODEL,
     GEMINI_API_KEY,
     GEMINI_BASE_URL,
     GEMINI_MCP_HTTP_SECRET,
@@ -115,6 +119,31 @@ _CONTENT_TYPE_TO_MIME: dict[str, str] = {
     "image/gif": "image/gif",
 }
 
+# ---------------------------------------------------------------------------
+# 处理模式（static / agentic）与「细看」相关常量
+# ---------------------------------------------------------------------------
+# mode="auto" 的分水岭：视频时长 >= 5 分钟就交给 agentic（模型自行决定看哪段、什么帧率），
+# 更短的片子官方建议仍走静态 1 FPS 全程抽帧——短片本来就不贵，agentic 反而可能漏掉细节。
+_AGENTIC_AUTO_MIN_DURATION_SEC = 300.0
+
+# 「细看」只给了 start 没给 end 时，默认往后看多少秒。
+_DETAIL_DEFAULT_WINDOW_SEC = 30.0
+# 「细看」抽帧率上限（再高 token 涨得离谱，实际收益有限）。
+_DETAIL_MAX_FPS = 10.0
+
+# ---------------------------------------------------------------------------
+# Files API 上传缓存（同一个视频第二次识别时不再重传）
+# ---------------------------------------------------------------------------
+# 缓存索引文件（放在 temp_media/ 里，随目录一起被 gitignore）。
+_UPLOAD_CACHE_NAME = "upload_cache.json"
+# 缓存条目数上限与远端总字节上限（Files API 免费层存储 2GB，留出余量）。
+_UPLOAD_CACHE_MAX_ENTRIES = 30
+_UPLOAD_CACHE_MAX_BYTES = 1536 * 1024 * 1024
+# 过期前多久就当它失效（避免刚好卡在过期边缘发请求）。
+_UPLOAD_CACHE_EXPIRY_MARGIN_SEC = 300.0
+# 读改写缓存文件的互斥锁（本进程内单事件循环，够用）。
+_UPLOAD_CACHE_LOCK = asyncio.Lock()
+
 # view_media 相关：图片/视频后缀集合与缩放边长的合理区间。
 _VIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # 视频后缀 = 识别支持的全部后缀去掉 .gif（gif 归到图片一侧，取首帧）。
@@ -128,11 +157,13 @@ _VIEW_MAX_DIMENSION = 4096
 # ---------------------------------------------------------------------------
 # 源自 MoFox-Bot 的 batch_analysis_prompt（sol 亲测“效果好到浮夸”的那版），
 # 文风上有意【不】压制（不禁止抒情、不要求客观简洁），保留 Gemini 自由发挥的戏剧张力；
-# 但另立三条硬规则（_DEFAULT_PROMPT_RULES）兜住实测踩到的坑：
+# 但另立四条硬规则（_DEFAULT_PROMPT_RULES）兜住实测踩到的坑：
 #   ① 知识边界——Gemini 的训练知识截止较早，实测会把 2026 年新发布的官方内容一口咬定成“同人/概念 Mod”，
 #      故明确禁止仅凭“训练数据里没有”就对真伪、出处、是否官方下断言；
 #   ② 零翻译——视频里的台词/字幕/歌词一律原文照录，不译成中文（sol 明确要求），描述性行文仍用中文；
-#   ③ 降解读、升描述——少讲文字“意味着什么”，多讲它长什么样、怎么出现、与画面声音怎么配合。
+#   ③ 降解读、升描述——少讲文字“意味着什么”，多讲它长什么样、怎么出现、与画面声音怎么配合；
+#   ④ 禁止静默省略——实测 3.1 Pro 会把看不清、拿不准的元素直接跳过不提（省略无需标注、零风险），
+#      故要求不确定内容必须带不确定度写出（疑似 X / 无法辨认 + 物理特征），不许从描述里消失。
 # 原文两处重复的编号“6.”这里顺手改成 6 / 7；两行人设占位符改由 persona 参数按需插入。
 
 _DEFAULT_PROMPT_HEAD = (
@@ -151,7 +182,7 @@ _DEFAULT_PROMPT_BODY = """请提供详细的视频内容讲述，提供详细的
 6. 是否有背景音乐/音效、背景音？如有，是什么样的感觉？是什么风格的？是否具有音乐卡点？音乐在此处起到了什么作用（反差？讽刺？增强气氛？），给人什么样的听觉和感官体验？如有歌词，逐字照录原文，听不清的地方标注「听不清」，不要脑补，也不要转述大意
 7. 任何特殊的视觉效果或文字内容。屏幕上出现的一切文字（字幕、标题、UI、弹幕、涂鸦、背景招牌）都请原文逐字转录，并描述它的呈现形式：字体、字号、颜色、在画面里的位置、停留多久、以什么方式出现和消失（淡入、打字机、闪现、被划掉），以及它出现在哪一个镜头、和哪个动作或哪一声音效同步"""
 
-_DEFAULT_PROMPT_RULES = """以下三条是硬规则，优先于上面的任何要求：
+_DEFAULT_PROMPT_RULES = """以下四条是硬规则，优先于上面的任何要求：
 
 一、关于你不认识的内容：请假定你的训练知识截止约在 2026 年 1 月，而视频里完全可能出现比这更晚发布的官方作品、正式发行的新内容、新角色、新版本。因此「我的训练数据里没有」绝不等于「这是同人、二创、Mod、概念演示、恶搞或假货」。禁止仅凭眼生就对内容的真伪、出处、是否官方下任何断言。遇到认不出的东西，照实描述你看到和听到的即可，需要时直接写「无法确认出处」。
 
@@ -159,14 +190,16 @@ _DEFAULT_PROMPT_RULES = """以下三条是硬规则，优先于上面的任何�
 
 三、多描述，少解读：把力气花在「呈现出了什么」上，而不是「这意味着什么」。文字和语言内容尤其如此——不必分析台词或歌词的主题、寓意、潜台词、文化背景，也不用总结它想表达什么；请改为描述它长什么样、怎么出现、和画面与声音怎么配合。氛围与感受可以照常写，那是你亲眼所见的质地，不是文本分析。
 
+四、不确定不等于不存在，禁止静默省略：画面或声音里任何你看不清、听不辨、认不出、拿不准的元素——模糊的背景、一闪而过的物体、低画质下的小字、嘈杂环境里的人声——一律不许因为「不确定」就跳过不写。正确做法是把它连同你的不确定度一起写出来：能给出最可能的猜测就写「疑似 X／像是 X」，猜不出是什么就描述你确实看到的物理特征（轮廓、颜色、位置、出现时刻与时长）再注明「无法辨认」。这与第二条的「不要脑补」并不冲突：脑补是把猜测当事实写，这里要求的是把猜测标成猜测写出来。读这段描述的一方看不到视频，你没写的东西对它就等于从不存在——取舍确定性是读者的事，你的职责是不让任何出现过的东西从描述里消失。
+
 请用中文书写描述（引用的原文除外），结果要详细准确。"""
 
 
 def _build_default_prompt(persona: str | None, hint: str | None = None) -> str:
     """拼出默认提示词；传了 persona 就在开头位置附体一行人设，传了 hint 就注入人类观看者的前置线索。
 
-    末尾固定追加三条硬规则（知识边界 / 原文照录不翻译 / 多描述少解读），放在最后是为了让它们
-    压过前面的描述清单与人设——实测里模型更容易服从最后读到的约束。
+    末尾固定追加四条硬规则（知识边界 / 原文照录不翻译 / 多描述少解读 / 禁止静默省略），
+    放在最后是为了让它们压过前面的描述清单与人设——实测里模型更容易服从最后读到的约束。
     """
     segments = [_DEFAULT_PROMPT_HEAD]
     if persona:
@@ -181,6 +214,224 @@ def _build_default_prompt(persona: str | None, hint: str | None = None) -> str:
     segments.append(_DEFAULT_PROMPT_RULES)
     # 用空行分隔各段，还原原版排版观感。
     return "\n\n".join(segments)
+
+
+# ---------------------------------------------------------------------------
+# 「细看」提示词（只看某一段时用；与上面的默认模板并列，不覆盖它）
+# ---------------------------------------------------------------------------
+# 传了 start/end 就说明人已经看过一遍、想回头盯住某几秒，所以这版模板不再要求通篇概览：
+#   - hint 像个问句 -> 就这一段回答这个问题；
+#   - 否则 -> 按秒级时间戳把这一段的动作、声音、字幕拆开写。
+# 复用默认模板的四条硬规则（知识边界 / 原文照录不翻译 / 多描述少解读 / 禁止静默省略）。
+
+_DETAIL_PROMPT_HEAD = (
+    "你现在只会看到这个视频的其中一小段（原视频的第 {start} 到第 {end} 秒），"
+    "而不是全片。请把注意力全部放在这一段上，不要概述全片，也不要谈论这一段之外发生了什么。"
+    "回答里出现时间戳时，请用【原视频的绝对时间】（也就是从第 {start} 秒往后数），精确到秒。"
+)
+
+_DETAIL_PROMPT_QUESTION = """人类观看者看过整段视频，现在专门回放这几秒，想弄清楚一件事：
+
+「{question}」
+
+请先直接回答这个问题，答完再补上这一段里与之相关的细节：谁在什么时刻做了什么动作、身体和视线朝向哪里、
+物件怎么移动、画面怎么切换、声音里有什么（说话请逐字照录，也包括笑声、音效、动物叫声、背景音）、
+屏幕上出现了什么文字。看不清、听不清的地方照实说不确定，不要为了把问题答圆而虚构细节。"""
+
+_DETAIL_PROMPT_DESCRIBE = """请按秒级时间戳把这一段拆开细讲，每一个明显的动作或声音变化都单独占一行，格式形如
+「00:41 ——」。每一行都要交代清楚：
+
+1. 人物/动物的动作：谁、用哪只手/哪个部位、朝哪个方向、快还是慢、动作之间怎么衔接；
+2. 声音：说话内容逐字照录（连语气词、气声、含糊的字都尽量还原，听不清就标「听不清」），
+   以及笑声、呼吸、动物叫声、碰撞声、音效、背景音乐的变化；
+3. 屏幕上的文字：字幕、贴纸、UI，逐字照录，并说明它出现和消失的时刻；
+4. 画面本身：镜头有没有推拉摇晃、有没有剪辑点、光线和构图的变化。"""
+
+
+# agentic 模式专用的提示词尾巴：Interactions 会把模型的"检索计划/自言自语"一并写进 model_output，
+# 实测（gemini-3.8-flash）正文开头会出现"现在对照用户的所有要求：1. …"这类工作笔记。这里直接要求它别写。
+_AGENTIC_PROMPT_SUFFIX = (
+    "\n\n（这一次你可以自己决定回看视频的哪几段、用什么帧率、要不要调取音轨。"
+    "但最终请【只】输出给读者看的描述正文——不要写检索计划，不要复述上面的要求清单，"
+    "也不要保留「让我再听一遍这段」这类过程中的自言自语。）"
+)
+
+
+def _build_detail_prompt(persona: str | None, hint: str | None, start: float, end: float) -> str:
+    """拼出「细看」提示词：hint 像问句就针对这段答题，否则按秒级时间戳细描这一段。"""
+    segments = [_DETAIL_PROMPT_HEAD.format(start=f"{start:g}", end=f"{end:g}")]
+    if persona:
+        segments.append(f"你的人设是：{persona.strip()}")
+
+    question = (hint or "").strip()
+    if question and _looks_like_question(question):
+        segments.append(_DETAIL_PROMPT_QUESTION.format(question=question))
+    else:
+        if question:
+            segments.append(
+                f"观看前的已知信息：人类观看者对这个视频的形容是：「{question}」。"
+                "这只是理解画面的线索，请以你实际看到、听到的为准，不要为了迎合它虚构细节。"
+            )
+        segments.append(_DETAIL_PROMPT_DESCRIBE)
+
+    segments.append(_DEFAULT_PROMPT_RULES)
+    return "\n\n".join(segments)
+
+
+# 疑问句判定用的词表。中文没有词边界，按子串命中即可；英文必须整词命中，
+# 且 is/are/do/did/can 这类助动词只在【句首】才算提问——否则 "this is a cat video"、
+# "a clip of his dog" 这类陈述句会被误判成问题，细看模板就跑去"回答"一句描述。
+_QUESTION_WORDS_CJK = (
+    "吗",
+    "呢",
+    "什么",
+    "怎么",
+    "怎样",
+    "如何",
+    "为什么",
+    "为何",
+    "哪",
+    "谁",
+    "多少",
+    "几时",
+    "是不是",
+    "有没有",
+    "是否",
+)
+# 疑问代词/副词：出现在句子任何位置都算提问。
+_QUESTION_WH_RE = re.compile(r"\b(what|why|how|who|where|when|which|whether)\b")
+# 助动词：只有开头才算提问（一般疑问句的语序特征）。
+_QUESTION_AUX_RE = re.compile(r"^(did|does|do|is|are|can)\b")
+
+
+def _looks_like_question(text: str) -> bool:
+    """判断 hint 是不是一个问题：以问号收尾，或含疑问词（英文助动词只认句首）。"""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("？", "?")):
+        return True
+    lowered = stripped.lower()
+    if any(word in lowered for word in _QUESTION_WORDS_CJK):
+        return True
+    return bool(_QUESTION_WH_RE.search(lowered) or _QUESTION_AUX_RE.match(lowered))
+
+
+# ---------------------------------------------------------------------------
+# 处理模式与「细看」参数的解析
+# ---------------------------------------------------------------------------
+
+
+def _parse_time_value(value: float | str | None) -> tuple[float | None, str | None]:
+    """把时间参数解析成秒；接受数字（秒）或 "m:ss" / "h:mm:ss" 写法。
+
+    Returns:
+        (秒数, None) 或 (None, 中文错误)。传 None 返回 (None, None)。
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
+        return None, f"时间参数写法看不懂：{value!r}。请给秒数（如 39）或 \"分:秒\"（如 1:06）。"
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None, None
+        if ":" in raw:
+            parts = raw.split(":")
+            if len(parts) > 3:
+                return None, f"时间写法看不懂：{raw}。最多支持 时:分:秒（如 1:02:03）。"
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                return None, f"时间写法看不懂：{raw}。请给秒数（如 39）或 \"分:秒\"（如 1:06）。"
+            seconds = 0.0
+            for num in nums:
+                seconds = seconds * 60 + num
+        else:
+            try:
+                seconds = float(raw)
+            except ValueError:
+                return None, f"时间写法看不懂：{raw}。请给秒数（如 39）或 \"分:秒\"（如 1:06）。"
+    if seconds < 0:
+        return None, f"时间不能是负数：{value!r}。"
+    return seconds, None
+
+
+def _resolve_mode(mode: str | None, duration: float | None) -> tuple[str, str | None]:
+    """决定这次走 static 还是 agentic。
+
+    Returns:
+        (模式, 给页脚的说明或 None)。auto 时按时长分流；读不到时长一律 static。
+    """
+    raw = (mode or "auto").strip().lower()
+    if raw not in ("auto", "static", "agentic"):
+        return "static", f"mode 值「{mode}」无法识别（可用：auto / static / agentic），已按 static 处理。"
+    if raw != "auto":
+        return raw, None
+    if duration and duration >= _AGENTIC_AUTO_MIN_DURATION_SEC:
+        return "agentic", None
+    return "static", None
+
+
+def _resolve_detail_range(
+    start: float | str | None,
+    end: float | str | None,
+    fps: float | None,
+    duration: float | None,
+) -> tuple[tuple[float, float] | None, float | None, str | None]:
+    """校验并归一「细看」参数。
+
+    Returns:
+        (区间 或 None, 归一后的 fps 或 None, 中文错误 或 None)。start/end 都没给就返回 (None, None, None)。
+    """
+    if start is None and end is None:
+        if fps is not None:
+            return None, None, "fps 只在「细看」时有意义，请同时给出 start（和 end），指明要盯住哪一段。"
+        return None, None, None
+
+    start_sec, err = _parse_time_value(start if start is not None else 0)
+    if err:
+        return None, None, f"start 参数有问题：{err}"
+    end_sec, err = _parse_time_value(end)
+    if err:
+        return None, None, f"end 参数有问题：{err}"
+
+    start_sec = start_sec or 0.0
+    if end_sec is None:
+        end_sec = start_sec + _DETAIL_DEFAULT_WINDOW_SEC
+        if duration and duration > start_sec:
+            end_sec = min(end_sec, duration)
+    if duration and start_sec >= duration:
+        return None, None, (
+            f"start（{start_sec:g} 秒）已经超过视频总时长（约 {duration:.1f} 秒），没有可看的画面。"
+        )
+    if duration and end_sec > duration:
+        end_sec = duration
+    if end_sec <= start_sec:
+        return None, None, f"end（{end_sec:g} 秒）必须大于 start（{start_sec:g} 秒）。"
+
+    fps_value: float | None = None
+    if fps is not None:
+        try:
+            fps_value = float(fps)
+        except (TypeError, ValueError):
+            return None, None, f"fps 写法看不懂：{fps!r}，请给一个数字（如 5）。"
+        if fps_value <= 0:
+            return None, None, "fps 必须大于 0。"
+        if fps_value > _DETAIL_MAX_FPS:
+            return None, None, f"fps 最高 {_DETAIL_MAX_FPS:g}（你给的是 {fps_value:g}），再高 token 会涨得很离谱。"
+
+    return (start_sec, end_sec), fps_value, None
+
+
+def _build_video_metadata(start: float, end: float, fps: float | None) -> dict[str, object]:
+    """拼出 videoMetadata（只看某一段 / 换抽帧率）。offset 用 proto Duration 的字符串写法。"""
+    metadata: dict[str, object] = {"start_offset": f"{start:g}s", "end_offset": f"{end:g}s"}
+    if fps:
+        metadata["fps"] = fps
+    return metadata
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +464,161 @@ def _validate_local_file(path: str) -> tuple[Path | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Files API 上传缓存：同一个视频再看一次，不重传
+# ---------------------------------------------------------------------------
+# 键用【内容的 sha256】，不是 path+size+mtime。理由有三：
+#   ① 共享识别管线 _describe_video_bytes 只拿得到字节，拿不到路径（直链下载那条入口本来就没有稳定路径）；
+#   ② 内容寻址能跨改名/移动/重复下载复用同一份远端文件，path 方案换个目录就白传一次；
+#   ③ 20MB 算一次 sha256 只要几十毫秒（还丢在线程池里），相对一次上传的几十秒完全可以忽略。
+# 远端文件由 Google 侧 48 小时后自动清理，本地索引每次复用前都用 files.get 校验 state 与过期时间。
+
+
+def _upload_cache_path() -> Path:
+    return _TEMP_MEDIA_DIR / _UPLOAD_CACHE_NAME
+
+
+def _load_upload_cache_blocking() -> dict[str, dict]:
+    """读缓存索引；文件不存在/损坏一律当空（缓存丢了最多多传一次，不该报错）。"""
+    path = _upload_cache_path()
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _save_upload_cache_blocking(cache: dict[str, dict]) -> None:
+    """写缓存索引（尽力而为，写不进去只影响下次是否命中）。"""
+    _ensure_temp_media_dir()
+    try:
+        _upload_cache_path().write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        logger.debug("写上传缓存索引失败（忽略）：%s", e)
+
+
+def _parse_rfc3339(value: str | None) -> datetime | None:
+    """解析 Files API 返回的 expirationTime（RFC3339）；解析不了返回 None。"""
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip().replace("Z", "+00:00")
+    # 秒的小数位超过 6 位时 fromisoformat 会报错，先截断到微秒。
+    raw = re.sub(r"(\.\d{6})\d+", r"\1", raw)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _sha256_blocking(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _cache_num(value: object) -> float:
+    """读缓存条目里的数字字段：坏值一律当 0。
+
+    索引文件是纯 JSON，手改坏一个 size / saved_at（改成字符串）就会让 float()/int() 抛 ValueError。
+    那时上传已经花掉了，却在记账这一步炸掉整条识别管线，代价完全不对等，所以这里一律降级为 0。
+    """
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _evict_upload_cache(cache: dict[str, dict], protect_key: str | None = None) -> list[str]:
+    """把缓存压回条目数/总字节上限内，返回被淘汰条目的远端文件名（供调用方尽力删除）。
+
+    protect_key 是这次刚上传、马上就要用的那条，永远不淘汰——否则遇到一个比总上限还大的视频时，
+    会把自己刚传上去的文件删掉，紧接着的识别请求就扑空了。
+    """
+    entries = sorted(cache.items(), key=lambda kv: _cache_num(kv[1].get("saved_at")))
+    total = sum(int(_cache_num(entry.get("size"))) for _, entry in entries)
+    dropped: list[str] = []
+    for key, entry in entries:
+        if len(cache) <= _UPLOAD_CACHE_MAX_ENTRIES and total <= _UPLOAD_CACHE_MAX_BYTES:
+            break
+        if key == protect_key:
+            continue
+        cache.pop(key, None)
+        total -= int(_cache_num(entry.get("size")))
+        name = entry.get("file_name")
+        if isinstance(name, str) and name:
+            dropped.append(name)
+    return dropped
+
+
+async def _get_or_upload_file(
+    video_bytes: bytes, mime_type: str, client: GeminiVideoClient
+) -> tuple[str, bool]:
+    """拿到这段视频在 Files API 上的 file_uri：命中缓存就复用，否则上传并记进缓存。
+
+    Returns:
+        (file_uri, 是否缓存命中)
+
+    Raises:
+        GeminiVideoError: 上传失败时（缓存读写失败不会抛，最多退化成每次都传）。
+    """
+    digest = await asyncio.to_thread(_sha256_blocking, video_bytes)
+
+    async with _UPLOAD_CACHE_LOCK:
+        cache = await asyncio.to_thread(_load_upload_cache_blocking)
+        entry = cache.get(digest)
+
+    if entry:
+        expire_at = _parse_rfc3339(entry.get("expire_time"))
+        now = datetime.now(UTC)
+        expired = bool(expire_at and (expire_at - now).total_seconds() <= _UPLOAD_CACHE_EXPIRY_MARGIN_SEC)
+        info = None if expired else await client.get_file_info(str(entry.get("file_name") or ""))
+        state = (info or {}).get("state")
+        if info and state == "ACTIVE" and entry.get("file_uri"):
+            logger.info("上传缓存命中：%s（%.1fMB，跳过重传）", entry.get("file_name"), len(video_bytes) / 1024 / 1024)
+            return str(entry["file_uri"]), True
+        logger.info(
+            "上传缓存未命中（记录已失效：expired=%s，state=%s），准备重传：%s",
+            expired,
+            state,
+            entry.get("file_name"),
+        )
+        async with _UPLOAD_CACHE_LOCK:
+            cache = await asyncio.to_thread(_load_upload_cache_blocking)
+            cache.pop(digest, None)
+            await asyncio.to_thread(_save_upload_cache_blocking, cache)
+    else:
+        logger.info("上传缓存未命中（没有这份内容的记录），开始上传 %.1fMB", len(video_bytes) / 1024 / 1024)
+
+    file_uri, file_name = await client.upload_video(video_bytes, mime_type)
+
+    # 记账：顺带取一次过期时间（取不到就只靠 files.get 校验）。
+    info = await client.get_file_info(file_name) or {}
+    dropped: list[str] = []
+    async with _UPLOAD_CACHE_LOCK:
+        cache = await asyncio.to_thread(_load_upload_cache_blocking)
+        cache[digest] = {
+            "file_name": file_name,
+            "file_uri": file_uri,
+            "mime_type": mime_type,
+            "size": len(video_bytes),
+            "expire_time": info.get("expirationTime"),
+            "saved_at": time.time(),
+        }
+        dropped = _evict_upload_cache(cache, protect_key=digest)
+        await asyncio.to_thread(_save_upload_cache_blocking, cache)
+
+    for name in dropped:
+        logger.info("上传缓存超出上限，淘汰旧远端文件：%s", name)
+        await client.delete_file(name)
+
+    return file_uri, False
+
+
+# ---------------------------------------------------------------------------
 # 识别管线的共享核心（describe_video 与 describe_video_url 都复用这一段）
 # ---------------------------------------------------------------------------
 
@@ -222,14 +628,20 @@ def _build_final_prompt_and_tokens(
     persona: str | None,
     hint: str | None,
     max_output_tokens: int,
+    detail_range: tuple[float, float] | None = None,
 ) -> tuple[str, int]:
     """把 prompt/persona/hint 组装成最终提示词，并把 max_output_tokens 归一化到下限之上。
 
     本地文件、直链下载、YouTube 直读三条入口都共用这一段，确保提示词组装（prompt 优先，
-    其次 persona/hint 版默认模板）与输出 token 下限保护完全一致、不漂移。
+    其次「细看」模板或 persona/hint 版默认模板）与输出 token 下限保护完全一致、不漂移。
     """
-    # 组装提示词（prompt 优先，其次 persona/hint 版默认模板）
-    final_prompt = prompt.strip() if prompt and prompt.strip() else _build_default_prompt(persona, hint)
+    # 组装提示词：自定义 prompt 优先；其次「细看」模板（给了 start/end 时）；最后默认模板。
+    if prompt and prompt.strip():
+        final_prompt = prompt.strip()
+    elif detail_range:
+        final_prompt = _build_detail_prompt(persona, hint, detail_range[0], detail_range[1])
+    else:
+        final_prompt = _build_default_prompt(persona, hint)
 
     # 输出 token 下限保护（思考 token 也计入此上限，太小会把正文挤没）
     try:
@@ -240,10 +652,12 @@ def _build_final_prompt_and_tokens(
     return final_prompt, effective_tokens
 
 
-def _format_describe_result(result: dict) -> str:
-    """把 Gemini 识别结果 dict 拼成最终返回文本（正文 + 末尾用量/截断页脚）。
+def _format_describe_result(result: dict, processing: str = "static", notes: list[str] | None = None) -> str:
+    """把 Gemini 识别结果 dict 拼成最终返回文本（正文 + 末尾用量/截断/处理方式页脚）。
 
     本地文件、直链下载、YouTube 直读三条入口都共用这一段，保证页脚格式与措辞一致。
+    processing 是这次实际走的处理方式说明（static / agentic / 细看区间等），会写进用量那一行。
+    notes 里放回退原因之类需要让用户看见的提醒。
     """
     text = result["text"]
     footer_lines: list[str] = []
@@ -251,15 +665,65 @@ def _format_describe_result(result: dict) -> str:
         footer_lines.append(
             "⚠️ 提示：描述可能被输出长度上限截断了。可调大 max_output_tokens（如 8192）后重试以获得完整内容。"
         )
+    for note in notes or []:
+        if note:
+            footer_lines.append(f"ℹ️ {note}")
     usage = result.get("usage")
     if usage:
         footer_lines.append(
             f"（用量：输入 {usage['prompt_tokens']:,} token，输出 {usage['output_tokens']:,} token，"
-            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}）"
+            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}；处理：{processing}）"
         )
+    else:
+        footer_lines.append(f"（通道：{result.get('channel')}；处理：{processing}；本次没拿到用量统计）")
     if footer_lines:
         text = text + "\n\n---\n" + "\n".join(footer_lines)
     return text
+
+
+def _agentic_model() -> str:
+    """agentic 路径实际用的模型：配了 GEMINI_AGENTIC_MODEL 就用它，否则沿用主模型。"""
+    return GEMINI_AGENTIC_MODEL or GEMINI_MODEL
+
+
+async def _run_static_generate(
+    client: GeminiVideoClient,
+    *,
+    video_bytes: bytes,
+    mime_type: str,
+    final_prompt: str,
+    effective_tokens: int,
+    low_resolution: bool,
+    file_uri: str | None,
+    video_metadata: dict | None,
+) -> dict:
+    """静态通道（generateContent）：思考等级不被支持时自动降级 low 重试一次。"""
+    try:
+        return await client.describe_video(
+            video_bytes=video_bytes,
+            prompt=final_prompt,
+            mime_type=mime_type,
+            max_output_tokens=effective_tokens,
+            low_resolution=low_resolution,
+            thinking_level=GEMINI_THINKING_LEVEL,
+            file_uri=file_uri,
+            video_metadata=video_metadata,
+        )
+    except GeminiVideoError as e:
+        # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
+        if "thinking level" not in str(e).lower():
+            raise
+        logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", GEMINI_MODEL, GEMINI_THINKING_LEVEL)
+        return await client.describe_video(
+            video_bytes=video_bytes,
+            prompt=final_prompt,
+            mime_type=mime_type,
+            max_output_tokens=effective_tokens,
+            low_resolution=low_resolution,
+            thinking_level="low",
+            file_uri=file_uri,
+            video_metadata=video_metadata,
+        )
 
 
 async def _describe_video_bytes(
@@ -271,46 +735,80 @@ async def _describe_video_bytes(
     hint: str | None,
     low_resolution: bool,
     max_output_tokens: int,
+    mode: str = "static",
+    detail_range: tuple[float, float] | None = None,
+    fps: float | None = None,
+    mode_note: str | None = None,
 ) -> str:
     """识别管线的共享核心：拿到【视频字节 + MIME】后，组装提示词、调用 Gemini、拼装中文返回文本。
 
     describe_video（本地文件）与 describe_video_url（直链下载）都复用这一段，确保两条入口的
     提示词组装、思考等级自动降级重试、用量/截断页脚逻辑完全一致、不漂移。
-    调用方需自行保证：API key 已存在、video_bytes 非空、mime_type 已判定。
+    调用方需自行保证：API key 已存在、video_bytes 非空、mime_type 已判定、mode 已按时长解析完。
+
+    - mode="static"：generateContent 全程按固定帧率抽帧（原有行为）；
+    - mode="agentic"：Interactions API，模型自己决定看哪段、什么帧率（需要先上传到 Files API）；
+      跑不通时自动回退 static，并把原因写进页脚。
+    - detail_range/fps：只看某一段（「细看」），走 videoMetadata，恒定 static。
     """
-    final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
+    final_prompt, effective_tokens = _build_final_prompt_and_tokens(
+        prompt, persona, hint, max_output_tokens, detail_range
+    )
+    video_metadata = _build_video_metadata(detail_range[0], detail_range[1], fps) if detail_range else None
+    notes: list[str] = [mode_note] if mode_note else []
 
     client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+    result: dict | None = None
+    processing = "static"
+
     try:
-        try:
-            result = await client.describe_video(
+        # 需要远端文件的两种情形：agentic（Interactions 只吃 uri）、以及超过内联上限的大文件。
+        file_uri: str | None = None
+        if mode == "agentic" or len(video_bytes) > VIDEO_INLINE_LIMIT_BYTES:
+            try:
+                file_uri, _cache_hit = await _get_or_upload_file(video_bytes, mime_type, client)
+            except GeminiVideoError as e:
+                if mode != "agentic":
+                    raise
+                notes.append(f"agentic 需要先把视频传到 Files API，这一步失败了（{e}），已改用 static 处理。")
+                mode = "static"
+                file_uri = None
+
+        if mode == "agentic" and file_uri:
+            try:
+                result = await client.describe_video_agentic(
+                    prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
+                    file_uri=file_uri,
+                    mime_type=mime_type,
+                    model=_agentic_model(),
+                )
+                processing = f"agentic（模型 {result.get('model')}）"
+            except GeminiVideoError as e:
+                notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 全程抽帧。")
+                mode = "static"
+
+        if result is None:
+            result = await _run_static_generate(
+                client,
                 video_bytes=video_bytes,
-                prompt=final_prompt,
                 mime_type=mime_type,
-                max_output_tokens=effective_tokens,
+                final_prompt=final_prompt,
+                effective_tokens=effective_tokens,
                 low_resolution=low_resolution,
-                thinking_level=GEMINI_THINKING_LEVEL,
+                file_uri=file_uri,
+                video_metadata=video_metadata,
             )
-        except GeminiVideoError as e:
-            # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
-            if "thinking level" not in str(e).lower():
-                raise
-            logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", GEMINI_MODEL, GEMINI_THINKING_LEVEL)
-            result = await client.describe_video(
-                video_bytes=video_bytes,
-                prompt=final_prompt,
-                mime_type=mime_type,
-                max_output_tokens=effective_tokens,
-                low_resolution=low_resolution,
-                thinking_level="low",
-            )
+            processing = "static"
+            if detail_range:
+                fps_note = f"，fps={fps:g}" if fps else ""
+                processing = f"static（细看 {detail_range[0]:g}s–{detail_range[1]:g}s{fps_note}）"
     except GeminiVideoError as e:
         return f"视频识别失败：{e}"
     except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
         logger.exception("视频识别管线未预期异常")
         return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
 
-    return _format_describe_result(result)
+    return _format_describe_result(result, processing, notes)
 
 
 async def _describe_youtube_url(
@@ -321,6 +819,8 @@ async def _describe_youtube_url(
     hint: str | None,
     low_resolution: bool,
     max_output_tokens: int,
+    mode: str = "static",
+    mode_note: str | None = None,
 ) -> str:
     """YouTube 视频页直读的共享核心：组装提示词、调用 Gemini 云端直读、拼装中文返回文本。
 
@@ -332,7 +832,27 @@ async def _describe_youtube_url(
     final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
 
     client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+    notes: list[str] = [mode_note] if mode_note else []
+    result: dict | None = None
+    processing = "static"
     try:
+        if mode == "agentic":
+            # YouTube 直读也能进 agentic：uri 直接给视频页链接，不带 mime_type。
+            try:
+                result = await client.describe_video_agentic(
+                    prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
+                    file_uri=youtube_url,
+                    mime_type=None,
+                    model=_agentic_model(),
+                )
+                processing = f"agentic（模型 {result.get('model')}）"
+            except GeminiVideoError as e:
+                notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 云端直读。")
+                result = None
+
+        if result is not None:
+            return _format_describe_result(result, processing, notes)
+
         try:
             result = await client.describe_youtube(
                 youtube_url,
@@ -359,7 +879,7 @@ async def _describe_youtube_url(
         logger.exception("YouTube 视频识别管线未预期异常")
         return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
 
-    return _format_describe_result(result)
+    return _format_describe_result(result, "static", notes)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +904,8 @@ def _enforce_temp_media_quota() -> None:
     try:
         if not _TEMP_MEDIA_DIR.exists():
             return
-        files = [f for f in _TEMP_MEDIA_DIR.iterdir() if f.is_file()]
+        # upload_cache.json 是索引不是媒体，删了只会让下次白传一遍，永远跳过。
+        files = [f for f in _TEMP_MEDIA_DIR.iterdir() if f.is_file() and f.name != _UPLOAD_CACHE_NAME]
         total = 0
         for f in files:
             try:
@@ -600,6 +1121,10 @@ async def describe_video(
     hint: str | None = None,
     low_resolution: bool = False,
     max_output_tokens: int = 30000,
+    mode: str = "auto",
+    start: float | str | None = None,
+    end: float | str | None = None,
+    fps: float | None = None,
 ) -> str:
     """把本地视频交给 Gemini 直传识别，返回按时间轴分段的详细内容描述（画面 + 音轨）。
 
@@ -620,6 +1145,11 @@ async def describe_video(
         max_output_tokens: 最大输出 token 数，默认 30000。内部有 2048 的下限保护
             （Gemini 的“思考”token 也计入这里；默认思考等级为 high，思考会占用
             数千 token，太小会把正文挤没。思考等级可用环境变量 GEMINI_THINKING_LEVEL 调整）。
+        mode: 处理方式。"auto"（默认：时长 ≥5 分钟走 agentic，否则 static）、"static"（全程按固定
+            帧率抽帧，短片和需要逐帧全描述时用）、"agentic"（模型自己决定看哪几段、用什么帧率，长视频省 token）。
+        start: 只看某一段的起点，秒数或 "1:06" 写法。给了 start/end 就进"细看"（强制 static，只把这一段喂给模型）。
+        end: 只看某一段的终点；只给 start 时默认往后看 30 秒。
+        fps: 细看时的抽帧率（默认 1，上限 10）。调高能抓住快动作，token 也按倍数涨。
 
     Returns:
         Gemini 生成的视频内容描述文本（末尾可能带用量统计或截断提示）。
@@ -662,7 +1192,20 @@ async def describe_video(
     if not video_bytes:
         return f"这个文件是空的（0 字节）：{p}"
 
-    # 6) 交给共享识别管线（组装提示词 + 调 Gemini + 拼装返回文本）
+    # 6) 时长（auto 分流与「细看」区间裁剪都要用；ffprobe 读不到就按 None 处理）
+    duration = await asyncio.to_thread(_probe_duration_blocking, str(p))
+
+    # 7) 「细看」参数 + 处理模式
+    detail_range, fps_value, err = _resolve_detail_range(start, end, fps, duration)
+    if err:
+        return err
+    if detail_range:
+        # 只看一段时恒定走 static：agentic 的自主取帧与"只喂这几秒"是两套思路，不叠加。
+        resolved_mode, mode_note = "static", None
+    else:
+        resolved_mode, mode_note = _resolve_mode(mode, duration)
+
+    # 8) 交给共享识别管线（组装提示词 + 调 Gemini + 拼装返回文本）
     return await _describe_video_bytes(
         video_bytes,
         mime_type,
@@ -671,6 +1214,10 @@ async def describe_video(
         hint=hint,
         low_resolution=low_resolution,
         max_output_tokens=max_output_tokens,
+        mode=resolved_mode,
+        detail_range=detail_range,
+        fps=fps_value,
+        mode_note=mode_note,
     )
 
 
@@ -687,6 +1234,7 @@ async def describe_video_url(
     hint: str | None = None,
     low_resolution: bool = False,
     max_output_tokens: int = 30000,
+    mode: str = "auto",
 ) -> str:
     """从【网络直链】下载、或从【YouTube 视频页】云端直读视频再交给 Gemini 识别，返回按时间轴分段的中文描述。
 
@@ -709,6 +1257,8 @@ async def describe_video_url(
         hint: 可选前置线索，仅在未传 prompt 时生效。
         low_resolution: 低清省钱开关，默认关闭。
         max_output_tokens: 最大输出 token，默认 30000（内部有 2048 下限保护）。
+        mode: 处理方式，含义同 describe_video："auto"（默认，≥5 分钟走 agentic）/"static"/"agentic"。
+            YouTube 链接读不到时长，auto 一律按 static 处理。
 
     Returns:
         Gemini 生成的视频描述文本（末尾可能带用量统计或截断提示）。
@@ -722,6 +1272,8 @@ async def describe_video_url(
     # YouTube 视频页：走 Gemini 云端直读通道（file_data.file_uri 直传，服务器不下载）。
     # _describe_youtube_url 内部已兜住所有异常、绝不裸抛出 MCP 边界。
     if _is_youtube_url(url):
+        # 拿不到时长（不下载），auto 只能按 static 走；显式要 agentic 则直接把视频页链接交给 Interactions。
+        yt_mode, yt_note = _resolve_mode(mode, None)
         return await _describe_youtube_url(
             url.strip(),
             prompt=prompt,
@@ -729,6 +1281,8 @@ async def describe_video_url(
             hint=hint,
             low_resolution=low_resolution,
             max_output_tokens=max_output_tokens,
+            mode=yt_mode,
+            mode_note=yt_note,
         )
 
     temp_path, mime_type, err = await _download_to_temp(url.strip())
@@ -740,6 +1294,8 @@ async def describe_video_url(
         video_bytes = await asyncio.to_thread(temp_path.read_bytes)
         if not video_bytes:
             return "下载到的文件是空的（0 字节），请确认这个直链有效。"
+        duration = await asyncio.to_thread(_probe_duration_blocking, str(temp_path))
+        resolved_mode, mode_note = _resolve_mode(mode, duration)
         return await _describe_video_bytes(
             video_bytes,
             mime_type,
@@ -748,6 +1304,8 @@ async def describe_video_url(
             hint=hint,
             low_resolution=low_resolution,
             max_output_tokens=max_output_tokens,
+            mode=resolved_mode,
+            mode_note=mode_note,
         )
     except Exception as e:  # noqa: BLE001 - 任何异常都不许裸抛出 MCP 边界
         logger.exception("describe_video_url 未预期异常")

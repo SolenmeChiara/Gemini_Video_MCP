@@ -64,6 +64,7 @@ You can also skip `.env` entirely and inject the key at registration time with `
 | `GEMINI_MODEL` | No | `gemini-3.5-flash` | Model identifier |
 | `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta` | API base URL; only change this if you're proxying |
 | `GEMINI_THINKING_LEVEL` | No | `high` | One of `minimal`/`low`/`medium`/`high`; set `minimal` to save cost |
+| `GEMINI_AGENTIC_MODEL` | No | empty (falls back to `GEMINI_MODEL`) | Model used for agentic mode; only needed when the main model doesn't support it |
 | `GEMINI_MCP_HTTP_SECRET` | Only for `--http` mode | — | The sole access lock for HTTP mode; server refuses to start without a real value |
 | `GEMINI_MCP_PUBLIC_BASE_URL` | No | none (falls back to `http://localhost:8768`) | Public URL after tunneling; used by `get_upload_url` to build the upload link |
 
@@ -260,6 +261,41 @@ total). The stdio/local mode does **not** expose this endpoint.
   to Claude).
 - "About how many tokens would it cost to describe `D:/videos/long.mp4`?" → triggers `estimate_cost`.
 - Want to save money on a long video? Have Claude set `low_resolution=True`.
+
+## Processing modes (static / agentic) and close-ups
+
+Both `describe_video` and `describe_video_url` accept a `mode` argument:
+
+| `mode` | What it does | When to use |
+| --- | --- | --- |
+| `auto` (default) | agentic when the video is ≥ 5 minutes, static otherwise (static whenever the duration can't be read) | The set-and-forget choice |
+| `static` | `generateContent`, fixed-rate frame sampling over the whole video (1 FPS by default) | Short clips, or when you want every second described |
+| `agentic` | Interactions API — the model decides which stretches to look at, at what frame rate, and whether to listen to the audio | Hunting for something inside a long video; saves a lot of media tokens |
+
+Agentic requires the video to live in the Files API (small local files get uploaded once too). If it
+can't run, the server falls back to static and says why in the footer. When the main model doesn't
+support agentic, point `GEMINI_AGENTIC_MODEL` at one that does; static keeps using `GEMINI_MODEL`.
+**Don't use agentic on short clips**: a 92-second video measured ~13k tokens on static versus ~85k on
+agentic — it re-reads frames and pulls the audio track repeatedly.
+
+**Close-ups**: `describe_video` also accepts `start` / `end` / `fps`, feeding the model only that
+slice (always static in this mode).
+
+- Times can be seconds (`39`) or `m:ss` (`1:06`); with only `start`, it looks 30 seconds ahead;
+  `fps` defaults to 1 and is capped at 10;
+- If `hint` reads like a question (ends with a question mark or contains a question word), the model
+  answers that question about the slice; otherwise it walks through the slice second by second,
+  covering actions, sounds and on-screen text;
+- Timestamps in the answer still refer to the original video's timeline.
+
+**Upload cache**: videos that go through the Files API are recorded in
+`temp_media/upload_cache.json` keyed by content sha256, so re-describing the same file within 48
+hours reuses the remote file instead of uploading it again (the entry is validated against the Files
+API before reuse and re-uploaded if stale). Watching a video once and then zooming into a few
+seconds therefore costs a single upload.
+
+The usage line at the end of the returned text names the processing that actually ran
+(`处理：static` / `agentic（模型 …）` / `static（细看 39s–46s，fps=5）`).
 
 ## Cost notes
 

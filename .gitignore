@@ -39,3 +39,6 @@ Thumbs.db
 
 # 日志 / logs
 *.log
+
+# 施工备份文件（*.bak_YYYYMMDD）不入库
+*.bak_*

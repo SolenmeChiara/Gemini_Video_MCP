@@ -56,6 +56,7 @@ GEMINI_MODEL=gemini-3.5-flash
 | `GEMINI_MODEL` | 否 | `gemini-3.5-flash` | 模型标识 |
 | `GEMINI_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta` | API 根地址，走中转/代理时才需要改 |
 | `GEMINI_THINKING_LEVEL` | 否 | `high` | 思考等级：`minimal`/`low`/`medium`/`high`；想省钱改 `minimal` |
+| `GEMINI_AGENTIC_MODEL` | 否 | 空（沿用 `GEMINI_MODEL`） | agentic 模式专用模型；只有主模型不支持 agentic 时才需要设 |
 | `GEMINI_MCP_HTTP_SECRET` | 仅 `--http` 模式必填 | 无 | HTTP 模式的唯一门锁；缺失或仍是占位符会被拒绝启动 |
 | `GEMINI_MCP_PUBLIC_BASE_URL` | 否 | 无（回退 `http://localhost:8768`） | 经隧道暴露后的公网地址，`get_upload_url` 用它拼上传地址 |
 
@@ -230,6 +231,30 @@ print(resp.json())
 - "把 `D:/pics/meme.png` 这张图给你自己看看" → 触发 `view_media`（直接把图投给 Claude）。
 - "`D:/videos/long.mp4` 这个视频识别一次大概多少 token？" → 触发 `estimate_cost`。
 - 长视频想省钱：让 Claude 加 `low_resolution=True`。
+
+## 处理模式（static / agentic）与「细看」
+
+`describe_video` 与 `describe_video_url` 都接受 `mode`：
+
+| `mode` | 走哪条路 | 什么时候用 |
+| --- | --- | --- |
+| `auto`（默认） | 时长 ≥ 5 分钟走 agentic，否则 static；读不到时长一律 static | 不想操心就用它 |
+| `static` | `generateContent`，全程按固定帧率抽帧（默认 1 FPS） | 短片，或需要逐帧全程描述 |
+| `agentic` | Interactions API，模型自己决定看哪几段、用什么帧率、要不要听音轨 | 长视频里找线索，省下大量媒体 token |
+
+agentic 需要视频先落到 Files API（小视频也会被传一次）；跑不通会自动回退 static，并把原因写进页脚。
+主模型不支持 agentic 时，用 `GEMINI_AGENTIC_MODEL` 单独指一个支持的模型，static 仍用 `GEMINI_MODEL`。
+**短视频别开 agentic**：92 秒的片子实测 static 约 1.3 万 token，agentic 约 8.5 万——它会反复回看取帧、还要听音轨。
+
+**细看**：`describe_video` 另外接受 `start` / `end` / `fps`，只把这一段喂给模型（此时恒定 static）。
+
+- 时间写秒数（`39`）或 `分:秒`（`1:06`）都行；只给 `start` 时默认往后看 30 秒；`fps` 默认 1、上限 10；
+- `hint` 写成问句（问号结尾或含疑问词）就针对这一段回答问题，否则按秒级时间戳细讲这一段的动作、声音、字幕；
+- 返回的时间戳仍是原视频的绝对时间。
+
+**上传缓存**：走 Files API 的视频按内容 sha256 记进 `temp_media/upload_cache.json`，48 小时内再看同一个文件直接复用远端文件、不重传（复用前查一次文件状态，失效就重传）。所以「先整体看一遍，再回头细看某几秒」只上传一次。
+
+返回文本末尾的用量行里会写明这次实际走的处理方式（`处理：static` / `agentic（模型 …）` / `static（细看 39s–46s，fps=5）`）。
 
 ## 费用说明
 

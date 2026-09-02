@@ -57,6 +57,10 @@ GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 # API 根地址：默认 Google 官方生成式语言 API。
 GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip()
 
+# agentic 处理模式（Interactions API）专用的模型标识：留空则沿用 GEMINI_MODEL。
+# 只有部分模型支持 processing="agentic"；主模型不支持时在这里指定一个支持的（static 路径仍用 GEMINI_MODEL）。
+GEMINI_AGENTIC_MODEL: str = os.getenv("GEMINI_AGENTIC_MODEL", "").strip()
+
 # 思考等级：默认 high——实测思考越多文学发挥越好（sol 钦点"对 flash 慷慨点"）。
 # 想省钱可在 .env 里改成 minimal。有效值 minimal/low/medium/high；
 # 模型不支持时服务器会自动降级为 low 重试一次。
