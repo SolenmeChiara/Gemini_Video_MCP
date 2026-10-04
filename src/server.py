@@ -518,22 +518,41 @@ def _is_free_quota_error(e: GeminiVideoError) -> bool:
     return status in (429, 403) or "RESOURCE_EXHAUSTED" in str(e)
 
 
+FREE_KEY_503_MAX_ATTEMPTS = 3  # 免费档连续 503 这么多次就换付费档
+FREE_KEY_503_BACKOFF_SECONDS = (2.0, 5.0)  # 第 1、2 次 503 之后各等多久再试
+
+
+def _is_overloaded_error(e: GeminiVideoError) -> bool:
+    """模型高峰期排不上（503 UNAVAILABLE）：免费档先原档重试，连续几次后换付费档。"""
+    return getattr(e, "status", None) == 503
+
+
 async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaitable[T]]) -> tuple[T, str]:
-    """按 key_tier 跑 run(api_key, tier)；免费档撞额度/权限时用付费档整条重跑一次。
+    """按 key_tier 跑 run(api_key, tier)；免费档撞额度/权限、或连续 503 时用付费档整条重跑一次。
 
     整条重跑（而不是只重试生成那一步）是因为 Files API 上传的文件归属上传它的 key/项目，
     付费档看不到免费档传上去的文件，必须用付费 key 重新上传。上传缓存也按档位分开记。
+    免费档 503 时同档重试（上传缓存命中，不重复上传），累计 FREE_KEY_503_MAX_ATTEMPTS 次仍 503 才换付费档。
 
     Returns:
         (run 的返回值, 页脚用的档位标记 "free" / "paid" / "free→paid")
     """
     if key_tier == "free" and GEMINI_API_KEY_FREE:
-        try:
-            return await run(GEMINI_API_KEY_FREE, "free"), "free"
-        except GeminiVideoError as e:
-            if not _is_free_quota_error(e):
-                raise
-            logger.info("免费档 key 被拒（状态 %s），改用付费档 key 重跑一次", getattr(e, "status", None))
+        for attempt in range(1, FREE_KEY_503_MAX_ATTEMPTS + 1):
+            try:
+                return await run(GEMINI_API_KEY_FREE, "free"), "free"
+            except GeminiVideoError as e:
+                if _is_free_quota_error(e):
+                    logger.info("免费档 key 被拒（状态 %s），改用付费档 key 重跑一次", getattr(e, "status", None))
+                    break
+                if not _is_overloaded_error(e):
+                    raise
+                if attempt >= FREE_KEY_503_MAX_ATTEMPTS:
+                    logger.info("免费档连续 %d 次 503，改用付费档 key 重跑一次", attempt)
+                    break
+                delay = FREE_KEY_503_BACKOFF_SECONDS[min(attempt - 1, len(FREE_KEY_503_BACKOFF_SECONDS) - 1)]
+                logger.info("免费档第 %d 次 503，%.0f 秒后同档重试", attempt, delay)
+                await asyncio.sleep(delay)
         return await run(GEMINI_API_KEY, "paid"), "free→paid"
     return await run(GEMINI_API_KEY, "paid"), "paid"
 
@@ -877,7 +896,7 @@ async def _describe_video_bytes(
                 file_uri, _cache_hit = await _get_or_upload_file(video_bytes, mime_type, client, tier)
             except GeminiVideoError as e:
                 # 免费档撞额度时别悄悄降级成 static，抛出去让外层换付费档按原模式重跑。
-                if cur_mode != "agentic" or (tier == "free" and _is_free_quota_error(e)):
+                if cur_mode != "agentic" or (tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e))):
                     raise
                 notes.append(f"agentic 需要先把视频传到 Files API，这一步失败了（{e}），已改用 static 处理。")
                 cur_mode = "static"
@@ -893,7 +912,7 @@ async def _describe_video_bytes(
                 )
                 processing = f"agentic（模型 {result.get('model')}）"
             except GeminiVideoError as e:
-                if tier == "free" and _is_free_quota_error(e):
+                if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
                     raise
                 notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 全程抽帧。")
                 cur_mode = "static"
@@ -962,7 +981,7 @@ async def _describe_youtube_url(
                 )
                 return result, f"agentic（模型 {result.get('model')}）", notes
             except GeminiVideoError as e:
-                if tier == "free" and _is_free_quota_error(e):
+                if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
                     raise
                 notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 云端直读。")
 
