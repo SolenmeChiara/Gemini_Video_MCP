@@ -96,7 +96,12 @@ class GeminiVideoError(Exception):
 
     上层 MCP 工具会直接把 str(该异常) 展示给用户，因此消息必须是
     一句话就能看懂“出了什么事、该怎么办”的中文说明。
+    status 是触发它的 HTTP 状态码（非 HTTP 错误为 None），供上层判断要不要换 key 重试。
     """
+
+    def __init__(self, message: str = "", status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def guess_mime_type(path: str) -> str:
@@ -390,28 +395,33 @@ class GeminiVideoClient:
         if status in (400,):
             raise GeminiVideoError(
                 "Gemini 拒绝了请求（400）。常见原因：视频格式不被支持、请求体有误，或该模型不支持视频。"
-                f"\n服务端说明：{snippet}"
+                f"\n服务端说明：{snippet}",
+                status=status,
             )
         if status in (401, 403):
             raise GeminiVideoError(
                 "鉴权失败（401/403）。请检查 GEMINI_API_KEY 是否正确、是否已启用 Generative Language API，"
-                f"以及该 key 是否有权限访问此模型。\n服务端说明：{snippet}"
+                f"以及该 key 是否有权限访问此模型。\n服务端说明：{snippet}",
+                status=status,
             )
         if status == 404:
             raise GeminiVideoError(
                 f"找不到模型或资源（404）。请检查 GEMINI_MODEL（当前：{self.model}）是否拼写正确、是否可用。"
-                f"\n服务端说明：{snippet}"
+                f"\n服务端说明：{snippet}",
+                status=status,
             )
         if status == 429:
             raise GeminiVideoError(
                 "触发了 Gemini 的限流/配额上限（429）。请稍等一会儿再试，或检查你的免费额度是否用完。"
-                f"\n服务端说明：{snippet}"
+                f"\n服务端说明：{snippet}",
+                status=status,
             )
         if status >= 500:
             raise GeminiVideoError(
-                f"Gemini 服务端出错（{status}），通常是临时故障，请稍后重试。\n服务端说明：{snippet}"
+                f"Gemini 服务端出错（{status}），通常是临时故障，请稍后重试。\n服务端说明：{snippet}",
+                status=status,
             )
-        raise GeminiVideoError(f"Gemini 返回了异常状态码 {status}。\n服务端说明：{snippet}")
+        raise GeminiVideoError(f"Gemini 返回了异常状态码 {status}。\n服务端说明：{snippet}", status=status)
 
     async def _request_json(self, method: str, endpoint: str, data: dict | None = None) -> dict:
         """发起非流式请求并在 session 作用域内读完 JSON。

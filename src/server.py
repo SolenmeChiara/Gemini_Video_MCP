@@ -25,13 +25,17 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlparse
 
 import aiohttp
@@ -41,7 +45,9 @@ from mcp.types import ToolAnnotations
 from .config import (
     GEMINI_AGENTIC_MODEL,
     GEMINI_API_KEY,
+    GEMINI_API_KEY_FREE,
     GEMINI_BASE_URL,
+    GEMINI_FREE_KEY_DIRS,
     GEMINI_MCP_HTTP_SECRET,
     GEMINI_MCP_PUBLIC_BASE_URL,
     GEMINI_MODEL,
@@ -451,6 +457,91 @@ def _check_api_key() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 免费档 / 付费档 key 分流：公开内容先走免费档，额度满了回落付费档
+# ---------------------------------------------------------------------------
+# 免费档的数据可能被 Google 拿去训练，所以只有「本来就公开」的内容才配走免费档：
+# 直链下载、YouTube 直读、以及本地路径落在 GEMINI_FREE_KEY_DIRS 白名单里的文件。其余一律付费档。
+
+
+T = TypeVar("T")
+
+
+def _canon_path(raw: str) -> str:
+    """把路径归一成可比较的字符串：反斜杠→/、/mnt/d/… → d:/…、折叠 ..、盘符路径整体小写。"""
+    s = str(raw).strip().strip('"').strip("'").replace("\\", "/")
+    m = re.match(r"^/mnt/([a-zA-Z])(?:/|$)(.*)$", s)
+    if m:
+        s = f"{m.group(1)}:/{m.group(2)}"
+    s = posixpath.normpath(s) if s else s
+    if re.match(r"^[a-zA-Z]:", s):
+        # Windows 盘符路径大小写不敏感；normpath 会把 "d:/" 收成 "d:"，补回斜杠方便前缀比较。
+        s = s.lower()
+        if len(s) == 2:
+            s += "/"
+    return s
+
+
+_FREE_KEY_DIRS_CANON: list[str] = [_canon_path(d) for d in GEMINI_FREE_KEY_DIRS]
+
+
+def _key_tier_for_path(path: Path | str) -> str:
+    """本地文件该走哪档 key：解析符号链接后的真实路径落在白名单目录内 → "free"，否则 "paid"。"""
+    raw = str(path).strip().strip('"').strip("'")
+    try:
+        if os.name == "nt":
+            # Windows 下 realpath 会把 "/mnt/d/…" 当成当前盘根下的目录，先翻成 "d:/…" 再解析。
+            m = re.match(r"^/mnt/([a-zA-Z])(/.*)?$", raw)
+            if m:
+                raw = f"{m.group(1)}:{m.group(2) or '/'}"
+            real = os.path.realpath(raw)
+        elif re.match(r"^[a-zA-Z]:[\\/]", raw):
+            # 非 Windows 下 realpath 会把 "D:/…" 当相对路径拼上 cwd，这种写法直接交给 _canon_path 翻译。
+            real = raw
+        else:
+            real = os.path.realpath(raw)
+    except (OSError, ValueError):
+        return "paid"
+    cand = _canon_path(real)
+    for d in _FREE_KEY_DIRS_CANON:
+        if not d:
+            continue
+        prefix = d if d.endswith("/") else d + "/"
+        if cand == d or cand.startswith(prefix):
+            return "free"
+    return "paid"
+
+
+def _is_free_quota_error(e: GeminiVideoError) -> bool:
+    """免费档被拒、值得换付费档重跑的错误：429 / RESOURCE_EXHAUSTED / 403（权限、计费类型）。"""
+    status = getattr(e, "status", None)
+    return status in (429, 403) or "RESOURCE_EXHAUSTED" in str(e)
+
+
+async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaitable[T]]) -> tuple[T, str]:
+    """按 key_tier 跑 run(api_key, tier)；免费档撞额度/权限时用付费档整条重跑一次。
+
+    整条重跑（而不是只重试生成那一步）是因为 Files API 上传的文件归属上传它的 key/项目，
+    付费档看不到免费档传上去的文件，必须用付费 key 重新上传。上传缓存也按档位分开记。
+
+    Returns:
+        (run 的返回值, 页脚用的档位标记 "free" / "paid" / "free→paid")
+    """
+    if key_tier == "free" and GEMINI_API_KEY_FREE:
+        try:
+            return await run(GEMINI_API_KEY_FREE, "free"), "free"
+        except GeminiVideoError as e:
+            if not _is_free_quota_error(e):
+                raise
+            logger.info("免费档 key 被拒（状态 %s），改用付费档 key 重跑一次", getattr(e, "status", None))
+        return await run(GEMINI_API_KEY, "paid"), "free→paid"
+    return await run(GEMINI_API_KEY, "paid"), "paid"
+
+
+def _api_key_for_tier(key_tier: str) -> str:
+    return GEMINI_API_KEY_FREE if key_tier == "free" and GEMINI_API_KEY_FREE else GEMINI_API_KEY
+
+
 def _validate_local_file(path: str) -> tuple[Path | None, str | None]:
     """校验本地文件；返回 (Path, None) 或 (None, 中文错误)。"""
     if not path or not path.strip():
@@ -532,15 +623,15 @@ def _cache_num(value: object) -> float:
         return 0.0
 
 
-def _evict_upload_cache(cache: dict[str, dict], protect_key: str | None = None) -> list[str]:
-    """把缓存压回条目数/总字节上限内，返回被淘汰条目的远端文件名（供调用方尽力删除）。
+def _evict_upload_cache(cache: dict[str, dict], protect_key: str | None = None) -> list[tuple[str, str]]:
+    """把缓存压回条目数/总字节上限内，返回被淘汰条目的 (远端文件名, key 档位)（供调用方用对应 key 尽力删除）。
 
     protect_key 是这次刚上传、马上就要用的那条，永远不淘汰——否则遇到一个比总上限还大的视频时，
     会把自己刚传上去的文件删掉，紧接着的识别请求就扑空了。
     """
     entries = sorted(cache.items(), key=lambda kv: _cache_num(kv[1].get("saved_at")))
     total = sum(int(_cache_num(entry.get("size"))) for _, entry in entries)
-    dropped: list[str] = []
+    dropped: list[tuple[str, str]] = []
     for key, entry in entries:
         if len(cache) <= _UPLOAD_CACHE_MAX_ENTRIES and total <= _UPLOAD_CACHE_MAX_BYTES:
             break
@@ -550,14 +641,17 @@ def _evict_upload_cache(cache: dict[str, dict], protect_key: str | None = None) 
         total -= int(_cache_num(entry.get("size")))
         name = entry.get("file_name")
         if isinstance(name, str) and name:
-            dropped.append(name)
+            dropped.append((name, "free" if entry.get("key_tier") == "free" else "paid"))
     return dropped
 
 
 async def _get_or_upload_file(
-    video_bytes: bytes, mime_type: str, client: GeminiVideoClient
+    video_bytes: bytes, mime_type: str, client: GeminiVideoClient, key_tier: str = "paid"
 ) -> tuple[str, bool]:
     """拿到这段视频在 Files API 上的 file_uri：命中缓存就复用，否则上传并记进缓存。
+
+    远端文件归属上传它的 key/项目，所以缓存按档位分开：付费档沿用旧键（纯 sha256，旧索引照常命中），
+    免费档键加 "@free" 后缀。key_tier 必须与 client 用的 key 一致。
 
     Returns:
         (file_uri, 是否缓存命中)
@@ -566,6 +660,8 @@ async def _get_or_upload_file(
         GeminiVideoError: 上传失败时（缓存读写失败不会抛，最多退化成每次都传）。
     """
     digest = await asyncio.to_thread(_sha256_blocking, video_bytes)
+    if key_tier == "free":
+        digest += "@free"
 
     async with _UPLOAD_CACHE_LOCK:
         cache = await asyncio.to_thread(_load_upload_cache_blocking)
@@ -607,13 +703,18 @@ async def _get_or_upload_file(
             "size": len(video_bytes),
             "expire_time": info.get("expirationTime"),
             "saved_at": time.time(),
+            "key_tier": key_tier,
         }
         dropped = _evict_upload_cache(cache, protect_key=digest)
         await asyncio.to_thread(_save_upload_cache_blocking, cache)
 
-    for name in dropped:
+    for name, tier in dropped:
         logger.info("上传缓存超出上限，淘汰旧远端文件：%s", name)
-        await client.delete_file(name)
+        if tier == key_tier:
+            await client.delete_file(name)
+        else:
+            other = GeminiVideoClient(api_key=_api_key_for_tier(tier), model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+            await other.delete_file(name)
 
     return file_uri, False
 
@@ -652,13 +753,16 @@ def _build_final_prompt_and_tokens(
     return final_prompt, effective_tokens
 
 
-def _format_describe_result(result: dict, processing: str = "static", notes: list[str] | None = None) -> str:
+def _format_describe_result(
+    result: dict, processing: str = "static", notes: list[str] | None = None, key_label: str | None = None
+) -> str:
     """把 Gemini 识别结果 dict 拼成最终返回文本（正文 + 末尾用量/截断/处理方式页脚）。
 
     本地文件、直链下载、YouTube 直读三条入口都共用这一段，保证页脚格式与措辞一致。
     processing 是这次实际走的处理方式说明（static / agentic / 细看区间等），会写进用量那一行。
-    notes 里放回退原因之类需要让用户看见的提醒。
+    notes 里放回退原因之类需要让用户看见的提醒。key_label 是这次实际出力的 key 档位（free / paid / free→paid）。
     """
+    key_part = f"；key：{key_label}" if key_label else ""
     text = result["text"]
     footer_lines: list[str] = []
     if result.get("truncated"):
@@ -672,10 +776,10 @@ def _format_describe_result(result: dict, processing: str = "static", notes: lis
     if usage:
         footer_lines.append(
             f"（用量：输入 {usage['prompt_tokens']:,} token，输出 {usage['output_tokens']:,} token，"
-            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}；处理：{processing}）"
+            f"合计 {usage['total_tokens']:,} token；通道：{result.get('channel')}；处理：{processing}{key_part}）"
         )
     else:
-        footer_lines.append(f"（通道：{result.get('channel')}；处理：{processing}；本次没拿到用量统计）")
+        footer_lines.append(f"（通道：{result.get('channel')}；处理：{processing}{key_part}；本次没拿到用量统计）")
     if footer_lines:
         text = text + "\n\n---\n" + "\n".join(footer_lines)
     return text
@@ -739,6 +843,7 @@ async def _describe_video_bytes(
     detail_range: tuple[float, float] | None = None,
     fps: float | None = None,
     mode_note: str | None = None,
+    key_tier: str = "paid",
 ) -> str:
     """识别管线的共享核心：拿到【视频字节 + MIME】后，组装提示词、调用 Gemini、拼装中文返回文本。
 
@@ -750,31 +855,35 @@ async def _describe_video_bytes(
     - mode="agentic"：Interactions API，模型自己决定看哪段、什么帧率（需要先上传到 Files API）；
       跑不通时自动回退 static，并把原因写进页脚。
     - detail_range/fps：只看某一段（「细看」），走 videoMetadata，恒定 static。
+    - key_tier："free" 表示公开内容、先走免费档 key，撞额度/权限时整条换付费档重跑（见 _run_with_key_fallback）。
     """
     final_prompt, effective_tokens = _build_final_prompt_and_tokens(
         prompt, persona, hint, max_output_tokens, detail_range
     )
     video_metadata = _build_video_metadata(detail_range[0], detail_range[1], fps) if detail_range else None
-    notes: list[str] = [mode_note] if mode_note else []
 
-    client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
-    result: dict | None = None
-    processing = "static"
+    async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
+        # 每档 key 各跑一遍完整流程（上传 → agentic/static），notes 与 mode 都从头算，免得回退残留串档。
+        client = GeminiVideoClient(api_key=api_key, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+        notes: list[str] = [mode_note] if mode_note else []
+        cur_mode = mode
+        result: dict | None = None
+        processing = "static"
 
-    try:
         # 需要远端文件的两种情形：agentic（Interactions 只吃 uri）、以及超过内联上限的大文件。
         file_uri: str | None = None
-        if mode == "agentic" or len(video_bytes) > VIDEO_INLINE_LIMIT_BYTES:
+        if cur_mode == "agentic" or len(video_bytes) > VIDEO_INLINE_LIMIT_BYTES:
             try:
-                file_uri, _cache_hit = await _get_or_upload_file(video_bytes, mime_type, client)
+                file_uri, _cache_hit = await _get_or_upload_file(video_bytes, mime_type, client, tier)
             except GeminiVideoError as e:
-                if mode != "agentic":
+                # 免费档撞额度时别悄悄降级成 static，抛出去让外层换付费档按原模式重跑。
+                if cur_mode != "agentic" or (tier == "free" and _is_free_quota_error(e)):
                     raise
                 notes.append(f"agentic 需要先把视频传到 Files API，这一步失败了（{e}），已改用 static 处理。")
-                mode = "static"
+                cur_mode = "static"
                 file_uri = None
 
-        if mode == "agentic" and file_uri:
+        if cur_mode == "agentic" and file_uri:
             try:
                 result = await client.describe_video_agentic(
                     prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
@@ -784,8 +893,10 @@ async def _describe_video_bytes(
                 )
                 processing = f"agentic（模型 {result.get('model')}）"
             except GeminiVideoError as e:
+                if tier == "free" and _is_free_quota_error(e):
+                    raise
                 notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 全程抽帧。")
-                mode = "static"
+                cur_mode = "static"
 
         if result is None:
             result = await _run_static_generate(
@@ -802,13 +913,17 @@ async def _describe_video_bytes(
             if detail_range:
                 fps_note = f"，fps={fps:g}" if fps else ""
                 processing = f"static（细看 {detail_range[0]:g}s–{detail_range[1]:g}s{fps_note}）"
+        return result, processing, notes
+
+    try:
+        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run)
     except GeminiVideoError as e:
         return f"视频识别失败：{e}"
     except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
         logger.exception("视频识别管线未预期异常")
         return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
 
-    return _format_describe_result(result, processing, notes)
+    return _format_describe_result(result, processing, notes, key_label)
 
 
 async def _describe_youtube_url(
@@ -821,6 +936,7 @@ async def _describe_youtube_url(
     max_output_tokens: int,
     mode: str = "static",
     mode_note: str | None = None,
+    key_tier: str = "paid",
 ) -> str:
     """YouTube 视频页直读的共享核心：组装提示词、调用 Gemini 云端直读、拼装中文返回文本。
 
@@ -828,14 +944,13 @@ async def _describe_youtube_url(
     降级重试、返回格式化（_format_describe_result），唯一区别是底层换成 client.describe_youtube
     （file_data 直传 file_uri、服务器不下载、通道标 "youtube"），因此也没有临时文件需要清理。
     调用方需自行保证：API key 已存在、youtube_url 已判定为 YouTube 链接。
+    key_tier 含义同 _describe_video_bytes（YouTube 公开视频由调用方传 "free"）。
     """
     final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
 
-    client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
-    notes: list[str] = [mode_note] if mode_note else []
-    result: dict | None = None
-    processing = "static"
-    try:
+    async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
+        client = GeminiVideoClient(api_key=api_key, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+        notes: list[str] = [mode_note] if mode_note else []
         if mode == "agentic":
             # YouTube 直读也能进 agentic：uri 直接给视频页链接，不带 mime_type。
             try:
@@ -845,13 +960,11 @@ async def _describe_youtube_url(
                     mime_type=None,
                     model=_agentic_model(),
                 )
-                processing = f"agentic（模型 {result.get('model')}）"
+                return result, f"agentic（模型 {result.get('model')}）", notes
             except GeminiVideoError as e:
+                if tier == "free" and _is_free_quota_error(e):
+                    raise
                 notes.append(f"agentic 模式没能用上（{e}），已自动回退 static 云端直读。")
-                result = None
-
-        if result is not None:
-            return _format_describe_result(result, processing, notes)
 
         try:
             result = await client.describe_youtube(
@@ -873,13 +986,17 @@ async def _describe_youtube_url(
                 max_output_tokens=effective_tokens,
                 thinking_level="low",
             )
+        return result, "static", notes
+
+    try:
+        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run)
     except GeminiVideoError as e:
         return f"视频识别失败：{e}"
     except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
         logger.exception("YouTube 视频识别管线未预期异常")
         return f"发生了未预期的错误：{e}\n（如果反复出现，请把这条信息发给开发者。）"
 
-    return _format_describe_result(result, "static", notes)
+    return _format_describe_result(result, processing, notes, key_label)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1335,7 @@ async def describe_video(
         detail_range=detail_range,
         fps=fps_value,
         mode_note=mode_note,
+        key_tier=_key_tier_for_path(p),
     )
 
 
@@ -1283,6 +1401,7 @@ async def describe_video_url(
             max_output_tokens=max_output_tokens,
             mode=yt_mode,
             mode_note=yt_note,
+            key_tier="free",
         )
 
     temp_path, mime_type, err = await _download_to_temp(url.strip())
@@ -1306,6 +1425,7 @@ async def describe_video_url(
             max_output_tokens=max_output_tokens,
             mode=resolved_mode,
             mode_note=mode_note,
+            key_tier="free",
         )
     except Exception as e:  # noqa: BLE001 - 任何异常都不许裸抛出 MCP 边界
         logger.exception("describe_video_url 未预期异常")

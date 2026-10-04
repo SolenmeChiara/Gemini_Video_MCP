@@ -51,6 +51,20 @@ _load_env_file(_ENV_PATH)
 # API key：没有默认值（缺失时上层工具会给出清晰的中文引导）。
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 
+# 免费档 key（可选）：只用于【公开内容】——直链下载 / YouTube 直读，以及本地路径落在 GEMINI_FREE_KEY_DIRS 白名单内的文件。
+# 免费档的数据可能被 Google 用于训练，所以私人内容（上传端点、摄像头、截图等）一律走上面的付费 key。
+# 免费档遇到 429 / RESOURCE_EXHAUSTED / 403 时自动用付费 key 重跑一次。留空 = 只用付费 key（与旧行为一致）。
+GEMINI_API_KEY_FREE: str = os.getenv("GEMINI_API_KEY_FREE", "").strip()
+
+# 免费档 key 的本地目录白名单：分号分隔，Windows 写法（D:/...）与 WSL 写法（/mnt/d/...）都认。
+GEMINI_FREE_KEY_DIRS: list[str] = [
+    d.strip()
+    for d in os.getenv(
+        "GEMINI_FREE_KEY_DIRS", "D:/ClaudeExtentions/MCP/nudge-agent/mind/Claude_photos/video_cache"
+    ).split(";")
+    if d.strip()
+]
+
 # 模型名：默认沿用 MoFox-Bot 里 utils_video 走 Google 直连用的模型标识。
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
