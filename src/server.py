@@ -520,6 +520,20 @@ def _is_free_quota_error(e: GeminiVideoError) -> bool:
 
 FREE_KEY_503_MAX_ATTEMPTS = 3  # 免费档连续 503 这么多次就换付费档
 FREE_KEY_503_BACKOFF_SECONDS = (2.0, 5.0)  # 第 1、2 次 503 之后各等多久再试
+FREE_KEY_COOLDOWN_SECONDS = 40 * 60  # 免费档失败（连续 503 或额度/权限被拒）后停用这么久，期间直接走付费档
+
+# 免费档停用到期的时刻（time.monotonic()），0 表示没在冷却。进程内共享，重启清零。
+_free_key_disabled_until: float = 0.0
+
+
+def _free_key_cooling() -> bool:
+    return time.monotonic() < _free_key_disabled_until
+
+
+def _disable_free_key(reason: str) -> None:
+    global _free_key_disabled_until
+    _free_key_disabled_until = time.monotonic() + FREE_KEY_COOLDOWN_SECONDS
+    logger.info("免费档停用 %d 分钟（%s），期间公开内容直接走付费档", FREE_KEY_COOLDOWN_SECONDS // 60, reason)
 
 
 def _is_overloaded_error(e: GeminiVideoError) -> bool:
@@ -533,22 +547,25 @@ async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaita
     整条重跑（而不是只重试生成那一步）是因为 Files API 上传的文件归属上传它的 key/项目，
     付费档看不到免费档传上去的文件，必须用付费 key 重新上传。上传缓存也按档位分开记。
     免费档 503 时同档重试（上传缓存命中，不重复上传），累计 FREE_KEY_503_MAX_ATTEMPTS 次仍 503 才换付费档。
+    免费档一旦失败（连续 503 或额度/权限被拒），停用 FREE_KEY_COOLDOWN_SECONDS，期间的请求直接走付费档。
 
     Returns:
-        (run 的返回值, 页脚用的档位标记 "free" / "paid" / "free→paid")
+        (run 的返回值, 页脚用的档位标记 "free" / "paid" / "free→paid" / "paid（免费档冷却中）")
     """
     if key_tier == "free" and GEMINI_API_KEY_FREE:
+        if _free_key_cooling():
+            return await run(GEMINI_API_KEY, "paid"), "paid（免费档冷却中）"
         for attempt in range(1, FREE_KEY_503_MAX_ATTEMPTS + 1):
             try:
                 return await run(GEMINI_API_KEY_FREE, "free"), "free"
             except GeminiVideoError as e:
                 if _is_free_quota_error(e):
-                    logger.info("免费档 key 被拒（状态 %s），改用付费档 key 重跑一次", getattr(e, "status", None))
+                    _disable_free_key(f"被拒，状态 {getattr(e, 'status', None)}")
                     break
                 if not _is_overloaded_error(e):
                     raise
                 if attempt >= FREE_KEY_503_MAX_ATTEMPTS:
-                    logger.info("免费档连续 %d 次 503，改用付费档 key 重跑一次", attempt)
+                    _disable_free_key(f"连续 {attempt} 次 503")
                     break
                 delay = FREE_KEY_503_BACKOFF_SECONDS[min(attempt - 1, len(FREE_KEY_503_BACKOFF_SECONDS) - 1)]
                 logger.info("免费档第 %d 次 503，%.0f 秒后同档重试", attempt, delay)
