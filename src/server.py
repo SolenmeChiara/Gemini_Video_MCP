@@ -1658,24 +1658,155 @@ def _ffmpeg_frame_png(path: str, seek: float | None, max_dim: int) -> tuple[byte
     return result.stdout, None
 
 
+# ---- 拼图网格（不传 timestamp 时的默认视频行为）----
+# 时长 <60s 抽 9 帧，≥60s 抽 12 帧；取样点在 [2%, 98%] 区间等距（避开首尾黑场/片尾）。
+_GRID_SHORT_FRAMES = 9
+_GRID_LONG_FRAMES = 12
+_GRID_LONG_THRESHOLD_SEC = 60.0
+_GRID_EDGE_RATIO = 0.02
+# 每格宽度：横屏 480，竖屏 360（竖屏格子高，窄一点控制总体积）。
+_GRID_CELL_W_LANDSCAPE = 480
+_GRID_CELL_W_PORTRAIT = 360
+# 水印字体候选（按顺序取第一个存在的）；都不存在就不烫水印，只靠返回文本里的秒数清单。
+_GRID_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/consola.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+
+
+def _grid_layout(n: int, dims: tuple[int, int] | None) -> tuple[int, int, int]:
+    """按帧数与画面朝向决定 (列数, 行数, 每格宽)。横屏 3 列，竖屏多给列数让整图更接近方形。"""
+    portrait = bool(dims) and dims[1] > dims[0]
+    if n == _GRID_SHORT_FRAMES:
+        cols, rows = 3, 3
+    elif portrait:
+        cols, rows = 4, 3
+    else:
+        cols, rows = 3, 4
+    cell_w = _GRID_CELL_W_PORTRAIT if portrait else _GRID_CELL_W_LANDSCAPE
+    return cols, rows, cell_w
+
+
+def _grid_timestamps(duration: float, n: int) -> list[float]:
+    """在 [2%, 98%] 区间内等距取 n 个时间点（含两端）。"""
+    lo = duration * _GRID_EDGE_RATIO
+    hi = duration * (1.0 - _GRID_EDGE_RATIO)
+    if n <= 1:
+        return [duration / 2.0]
+    step = (hi - lo) / (n - 1)
+    return [lo + step * i for i in range(n)]
+
+
+def _grid_fontfile_option() -> str | None:
+    """返回可放进 drawtext 的 fontfile=... 片段；找不到字体返回 None。
+
+    滤镜图里冒号是选项分隔符，Windows 盘符 `C:` 必须转义成 `C\\:`（即滤镜文本里的 C\\:），
+    整个值再用单引号包住。路径统一用正斜杠。
+    """
+    for cand in _GRID_FONT_CANDIDATES:
+        if Path(cand).is_file():
+            escaped = cand.replace("\\", "/").replace(":", "\\:")
+            return f"fontfile='{escaped}'"
+    return None
+
+
+def _ffmpeg_grid_jpeg(
+    path: str, stamps: list[float], cols: int, rows: int, cell_w: int, watermark: bool
+) -> tuple[bytes | None, str | None]:
+    """一条 ffmpeg 命令：每个时间点各开一路 -ss 快速定位输入，缩放(+烫时间戳)后 concat → tile 拼成一张 JPEG。
+
+    阻塞函数，调用方丢线程池。Returns (jpeg_bytes, None) 或 (None, 中文错误)。
+    多路 -ss 输入比 select 滤镜快得多：不需要从头解码整段视频。
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None, "本机没有找到 ffmpeg，无法抽帧/拼图。请先安装 ffmpeg（本项目文档假设已装 ffmpeg 8.0）后重试。"
+    font_opt = _grid_fontfile_option() if watermark else None
+    cmd = [ffmpeg, "-nostdin", "-v", "error"]
+    for t in stamps:
+        cmd += ["-ss", f"{t:.3f}", "-i", path]
+    chains = []
+    labels = []
+    fs = max(14, cell_w // 18)
+    for i, t in enumerate(stamps):
+        # scale 到固定宽、高按比例取偶数；setsar=1 让各路参数一致，concat 才肯拼。
+        chain = f"[{i}:v:0]trim=end_frame=1,scale={cell_w}:-2,setsar=1,format=yuv420p"
+        if font_opt:
+            chain += (
+                f",drawtext={font_opt}:text='{t:.1f}s':fontsize={fs}:fontcolor=white"
+                f":box=1:boxcolor=black@0.55:boxborderw=4:x=6:y=6"
+            )
+        chains.append(f"{chain}[f{i}]")
+        labels.append(f"[f{i}]")
+    graph = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(stamps)}:v=1:a=0,tile={cols}x{rows}[out]"
+    cmd += [
+        "-filter_complex", graph, "-map", "[out]", "-frames:v", "1",
+        "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+    except (subprocess.SubprocessError, OSError) as e:
+        return None, f"调用 ffmpeg 拼图失败：{e}"
+    if result.returncode != 0 or not result.stdout:
+        errmsg = (result.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        return None, f"ffmpeg 没能拼出网格图。\nffmpeg 说明：{errmsg or '无'}"
+    return result.stdout, None
+
+
+async def _view_video_grid(path: str) -> Image | list | str:
+    """视频不传 timestamp 时的默认行为：等距抽帧拼网格，返回 [图片, 秒数清单文本]。"""
+    duration = await asyncio.to_thread(_probe_duration_blocking, path)
+    if not duration or duration <= 0:
+        # 读不到时长就没法等距取样：退回老行为抽第 0 秒单帧（不阻断）。
+        data, ferr = await asyncio.to_thread(_ffmpeg_frame_png, path, 0.0, 1024)
+        if ferr:
+            return ferr
+        return [Image(data=data, format="png"), "读不到视频时长，无法拼网格，已退回第 0 秒单帧。"]
+    n = _GRID_LONG_FRAMES if duration >= _GRID_LONG_THRESHOLD_SEC else _GRID_SHORT_FRAMES
+    dims = await asyncio.to_thread(_probe_dimensions_blocking, path)
+    cols, rows, cell_w = _grid_layout(n, dims)
+    stamps = _grid_timestamps(duration, n)
+    data, ferr = await asyncio.to_thread(_ffmpeg_grid_jpeg, path, stamps, cols, rows, cell_w, True)
+    watermark_note = "每格左上角烫了时间戳。"
+    if ferr:
+        # 水印（字体/转义）出问题时去掉 drawtext 再试一次；秒数清单兜底。
+        logger.warning("view_media 拼图带水印失败，去水印重试：%s", ferr)
+        data, ferr = await asyncio.to_thread(_ffmpeg_grid_jpeg, path, stamps, cols, rows, cell_w, False)
+        watermark_note = "（水印未能烫上，以下面清单为准。）"
+        if ferr:
+            return ferr
+    stamp_list = "、".join(f"{t:.1f}s" for t in stamps)
+    caption = (
+        f"视频时长 {duration:.1f}s，{cols}列×{rows}行 共 {n} 帧网格，{watermark_note}\n"
+        f"网格从左到右、从上到下对应秒数：{stamp_list}\n"
+        "想看某一刻的大图，用同一 path 加 timestamp=秒数 再调一次。"
+    )
+    return [Image(data=data, format="jpeg"), caption]
+
+
 @mcp.tool(structured_output=False)
-async def view_media(path: str, timestamp: float | None = None, max_dimension: int = 1024) -> Image | str:
+async def view_media(path: str, timestamp: float | None = None, max_dimension: int = 1024) -> Image | list | str:
     """把一张【图片】、或【视频的某一帧】作为图片内容直接返回，让调用方模型亲眼看到画面。
 
     - path 是图片（png/jpg/jpeg/webp/gif）：直接返回该图（长边超出 max_dimension 会等比缩小）。
       GIF 只返回首帧（想感知整段动画请用 describe_video）。
-    - path 是视频：给了 timestamp（秒）就抽那一帧；没给则抽正中间那一帧。需要本机有 ffmpeg。
+    - path 是视频：给了 timestamp（秒）就抽那一帧（单帧，受 max_dimension 控制）；
+      没给则返回【拼图网格】：时长 <60s 等距 9 帧（3×3），≥60s 等距 12 帧（横屏 3列×4行、竖屏 4列×3行），
+      取样避开首尾各 2%，每格左上角烫时间戳，并附一行「从左到右、从上到下对应秒数」清单。
+      网格是 JPEG、不受 max_dimension 控制。先看网格定位，再用 timestamp 抽感兴趣那一刻的大图。需要本机有 ffmpeg。
 
     与 describe_video 的分工：describe_video 让 Gemini 看视频写【文字】；view_media 把【画面本身】投给
     你（调用方模型）看。stdio / HTTP 模式都可用。
 
     Args:
         path: 本地图片或视频文件路径。
-        timestamp: 仅对视频有效，抽取该秒（float）的一帧；不填则取中间帧。
+        timestamp: 仅对视频有效，抽取该秒（float）的一帧；不填则返回整段的拼图网格。
         max_dimension: 返回图片的长边上限像素，默认 1024（超出等比缩小，不放大；范围 16~4096）。
 
     Returns:
-        一张图片内容（MCP ImageContent）；出错时返回一句中文说明。
+        一张图片内容（MCP ImageContent）；视频网格模式额外附一段秒数清单文本；出错时返回一句中文说明。
     """
     p, err = _validate_local_file(path)
     if err:
@@ -1713,9 +1844,8 @@ async def view_media(path: str, timestamp: float | None = None, max_dimension: i
         if suffix in _VIEW_VIDEO_EXTS:
             seek = timestamp
             if seek is None:
-                # 没给时间点 → 取中间帧（时长用现有 ffprobe 逻辑；读不到则退回第 0 秒）。
-                duration = await asyncio.to_thread(_probe_duration_blocking, str(p))
-                seek = (duration / 2.0) if (duration and duration > 0) else 0.0
+                # 没给时间点 → 等距抽帧拼网格（<60s 3×3，≥60s 12 帧），附秒数清单。
+                return await _view_video_grid(str(p))
             else:
                 try:
                     seek = float(seek)
