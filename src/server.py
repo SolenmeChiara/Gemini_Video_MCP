@@ -518,9 +518,10 @@ def _is_free_quota_error(e: GeminiVideoError) -> bool:
     return status in (429, 403) or "RESOURCE_EXHAUSTED" in str(e)
 
 
-FREE_KEY_503_MAX_ATTEMPTS = 3  # 免费档连续 503 这么多次就换付费档
-FREE_KEY_503_BACKOFF_SECONDS = (2.0, 5.0)  # 第 1、2 次 503 之后各等多久再试
+FREE_KEY_503_MAX_ATTEMPTS = 2  # 免费档连续 503/500 这么多次就换付费档（3 次加上传容易超过 CC 的 300 秒静默上限）
+FREE_KEY_503_BACKOFF_SECONDS = (2.0,)  # 第 1 次 503/500 之后等多久再试
 FREE_KEY_COOLDOWN_SECONDS = 40 * 60  # 免费档失败（连续 503 或额度/权限被拒）后停用这么久，期间直接走付费档
+FREE_KEY_ATTEMPT_TIMEOUT_SECONDS = 120  # 免费档单次超过这么久不回就换付费档（免费档排队时常拖过 CC 的 300 秒静默上限）
 
 # 免费档停用到期的时刻（time.monotonic()），0 表示没在冷却。进程内共享，重启清零。
 _free_key_disabled_until: float = 0.0
@@ -537,8 +538,8 @@ def _disable_free_key(reason: str) -> None:
 
 
 def _is_overloaded_error(e: GeminiVideoError) -> bool:
-    """模型高峰期排不上（503 UNAVAILABLE）：免费档先原档重试，连续几次后换付费档。"""
-    return getattr(e, "status", None) == 503
+    """模型高峰期排不上（503 UNAVAILABLE）或服务端临时故障（500 INTERNAL）：免费档先原档重试，连续几次后换付费档。"""
+    return getattr(e, "status", None) in (500, 503)
 
 
 async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaitable[T]]) -> tuple[T, str]:
@@ -557,7 +558,12 @@ async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaita
             return await run(GEMINI_API_KEY, "paid"), "paid（免费档冷却中）"
         for attempt in range(1, FREE_KEY_503_MAX_ATTEMPTS + 1):
             try:
-                return await run(GEMINI_API_KEY_FREE, "free"), "free"
+                return await asyncio.wait_for(
+                    run(GEMINI_API_KEY_FREE, "free"), timeout=FREE_KEY_ATTEMPT_TIMEOUT_SECONDS
+                ), "free"
+            except TimeoutError:
+                _disable_free_key(f"单次超过 {FREE_KEY_ATTEMPT_TIMEOUT_SECONDS} 秒未返回")
+                break
             except GeminiVideoError as e:
                 if _is_free_quota_error(e):
                     _disable_free_key(f"被拒，状态 {getattr(e, 'status', None)}")
