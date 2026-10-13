@@ -52,7 +52,6 @@ from .config import (
     GEMINI_MCP_HTTP_SECRET,
     GEMINI_MCP_PUBLIC_BASE_URL,
     GEMINI_MODEL,
-    GEMINI_MODEL_ALIASES,
     GEMINI_PAID_ONLY_MODELS,
     GEMINI_THINKING_LEVEL,
 )
@@ -593,16 +592,6 @@ async def _run_with_key_fallback(
 # ---------------------------------------------------------------------------
 # 按次选模型（工具的 model 参数）
 # ---------------------------------------------------------------------------
-_BUILTIN_MODEL_ALIASES: dict[str, str] = {
-    "argon": "gemini-4-argon",
-    "4": "gemini-4-argon",
-    "gemini-4": "gemini-4-argon",
-    "g4": "gemini-4-argon",
-    "flash": GEMINI_MODEL,
-    "default": GEMINI_MODEL,
-}
-_MODEL_ALIASES: dict[str, str] = {**_BUILTIN_MODEL_ALIASES, **GEMINI_MODEL_ALIASES}
-
 _KNOWN_MODELS_TTL_SECONDS = 3600
 _known_models_cache: tuple[float, list[str]] | None = None  # (取到的时刻 monotonic, 模型名列表)
 
@@ -611,62 +600,51 @@ def _is_paid_only_model(model: str) -> bool:
     return model.lower().startswith(GEMINI_PAID_ONLY_MODELS) if GEMINI_PAID_ONLY_MODELS else False
 
 
-async def _known_models() -> list[str]:
-    """通配符匹配用的候选模型表：models.list（缓存 1 小时）∪ 别名目标；列表拉不到就只用别名目标。"""
+async def _known_models() -> list[str] | None:
+    """models.list 的模型识别符（缓存 1 小时）；拉不到返回 None。"""
     global _known_models_cache
-    names: list[str] = []
     now = time.monotonic()
     if _known_models_cache and now - _known_models_cache[0] < _KNOWN_MODELS_TTL_SECONDS:
-        names = list(_known_models_cache[1])
-    elif GEMINI_API_KEY:
-        try:
-            client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL, timeout=30)
-            names = await client.list_models()
-            _known_models_cache = (now, list(names))
-        except Exception as e:  # noqa: BLE001 - 列表拉不到不致命，退回别名目标
-            logger.info("models.list 失败，通配符只在别名目标里匹配：%s", e)
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in [*names, *_MODEL_ALIASES.values()]:
-        if name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out
-
-
-def _alias_help() -> str:
-    pairs = sorted(_MODEL_ALIASES.items())
-    return "、".join(f"{a} → {m}" for a, m in pairs)
+        return list(_known_models_cache[1])
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL, timeout=30)
+        names = await client.list_models()
+    except Exception as e:  # noqa: BLE001 - 列表拉不到不致命
+        logger.info("models.list 失败：%s", e)
+        return None
+    _known_models_cache = (now, list(names))
+    return list(names)
 
 
 async def _resolve_model(raw: str | None) -> tuple[str | None, str | None]:
-    """把工具的 model 参数解析成真实模型名。返回 (模型名, None) 或 (None, 中文错误)。
+    """把工具的 model 参数解析成模型识别符。返回 (识别符, None) 或 (None, 中文错误)。
 
-    空 → GEMINI_MODEL；别名（不分大小写）；含 * 的通配符在已知模型里 fnmatch，恰好一个才用；
-    gemini- 开头的原样透传（可带 models/ 前缀）。
+    空 → GEMINI_MODEL；否则只认 models.list 里的识别符（不分大小写，可带 models/ 前缀），
+    含 * 的按 fnmatch 匹配，恰好一个才用。列表拉不到时完整识别符原样透传、通配符报错。
     """
-    value = (raw or "").strip()
+    value = (raw or "").strip().removeprefix("models/").strip()
     if not value:
         return GEMINI_MODEL, None
-    value = value.removeprefix("models/").strip()
-    alias = _MODEL_ALIASES.get(value.lower())
-    if alias:
-        return alias, None
+    known = await _known_models()
     if "*" in value:
+        if known is None:
+            return None, "暂时拉不到模型列表，通配符用不了，请写完整的模型识别符。"
         pattern = value.lower()
-        matches = [m for m in await _known_models() if fnmatch.fnmatchcase(m.lower(), pattern)]
+        matches = [m for m in known if fnmatch.fnmatchcase(m.lower(), pattern)]
         if len(matches) == 1:
             return matches[0], None
         if not matches:
-            return None, f"model 通配符「{value}」没有匹配到任何已知模型。可用别名：{_alias_help()}。"
+            return None, f"model 通配符「{value}」没有匹配到任何模型识别符。"
         shown = "、".join(matches[:25]) + (f" 等共 {len(matches)} 个" if len(matches) > 25 else "")
         return None, f"model 通配符「{value}」匹配到多个模型，请写得更具体：{shown}"
-    if value.lower().startswith("gemini-"):
+    if known is None:
         return value, None
-    return None, (
-        f"不认识的模型「{value}」。可传 gemini- 开头的完整模型名、带 * 的通配符，或这些别名：{_alias_help()}。"
-        "留空则用默认模型。"
-    )
+    for m in known:
+        if m.lower() == value.lower():
+            return m, None
+    return None, f"「{value}」不是可用的模型识别符。留空则用默认模型。"
 
 
 def _api_key_for_tier(key_tier: str) -> str:
@@ -1410,8 +1388,7 @@ async def describe_video(
         end: 只看某一段的终点；只给 start 时默认往后看 30 秒。
         fps: 细看时的抽帧率（默认 1，上限 10）。调高能抓住快动作，token 也按倍数涨。
         model: 可选，本次改用哪个 Gemini 模型；留空 = 默认模型（.env 的 GEMINI_MODEL）。
-            别名不分大小写：argon / 4 / gemini-4 / g4 → gemini-4-argon（仅付费档）；flash / default → 默认模型。
-            也可传 gemini- 开头的完整模型名，或带 * 的通配符（如 "gemini-4*"，恰好匹配一个才用）。
+            填模型识别符（如 "gemini-x-y"），也可带 * 的通配符，恰好匹配一个才用。
 
     Returns:
         Gemini 生成的视频内容描述文本（末尾可能带用量统计或截断提示）。
@@ -1529,8 +1506,7 @@ async def describe_video_url(
         mode: 处理方式，含义同 describe_video："auto"（默认，≥5 分钟走 agentic）/"static"/"agentic"。
             YouTube 链接读不到时长，auto 一律按 static 处理。
         model: 可选，本次改用哪个 Gemini 模型；留空 = 默认模型（.env 的 GEMINI_MODEL）。
-            别名不分大小写：argon / 4 / gemini-4 / g4 → gemini-4-argon（仅付费档）；flash / default → 默认模型。
-            也可传 gemini- 开头的完整模型名或带 * 的通配符。
+            填模型识别符（如 "gemini-x-y"），也可带 * 的通配符，恰好匹配一个才用。
 
     Returns:
         Gemini 生成的视频描述文本（末尾可能带用量统计或截断提示）。

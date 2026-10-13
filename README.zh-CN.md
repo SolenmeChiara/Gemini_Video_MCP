@@ -16,7 +16,7 @@ Gemini 描述视频的效果非常好——好到会自由发挥出戏剧张力�
   - **也直接支持 `.gif`**（以 `image/gif` 原格式直传，Gemini 能感知完整动画，不抽帧）；
   - 小视频（≤14MB）内联上传、单次完成；大视频自动走 Files API（上传→等待就绪→识别→用完删除远端文件），单文件上限 2GB；
   - `low_resolution` 低清省钱开关；`persona` 可让 Gemini 附体任意人格来解说；`hint` 可注入人类对视频的已有形容作为理解线索（适合抽象/玩梗内容，模型仍以实际所见为准）；`prompt` 完全自定义。
-  - `model`（可选，`describe_video_url` / `estimate_cost` 也有）：本次换哪个 Gemini 模型，留空用 `GEMINI_MODEL`。别名不分大小写：`argon` / `4` / `gemini-4` / `g4` → `gemini-4-argon`（仅付费档，跳过免费 key），`flash` / `default` → `GEMINI_MODEL`；`gemini-` 开头的完整名原样透传；带 `*` 的（如 `gemini-4*`）在 `models.list` 里匹配，恰好一个才用。页脚会写明实际作答的模型。
+  - `model`（可选，`describe_video_url` / `estimate_cost` 也有）：本次换哪个 Gemini 模型，填模型识别符，留空用 `GEMINI_MODEL`；带 `*` 的在 `models.list` 里匹配，恰好一个才用。仅付费档的模型（`GEMINI_PAID_ONLY_MODELS`）跳过免费 key。页脚会写明实际作答的模型。
 - `describe_video_url` —— 从**网络直链**下载视频再识别（下载到临时目录、识别完即删）。
   - 参数与 `describe_video` 完全一致，只是把 `path` 换成 `url`；
   - **只认视频文件直链**（点开就是视频本体、以 `.mp4/.mov/.webm` 等结尾）。视频网站的播放**页面**链接（B站/抖音/TikTok/YouTube 等）**不是直链、不支持解析**（那需要 yt-dlp 之类工具，属未来野心版，本轮不做）；
@@ -58,7 +58,6 @@ GEMINI_MODEL=gemini-3.5-flash
 | `GEMINI_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta` | API 根地址，走中转/代理时才需要改 |
 | `GEMINI_THINKING_LEVEL` | 否 | `high` | 思考等级：`minimal`/`low`/`medium`/`high`；想省钱改 `minimal` |
 | `GEMINI_AGENTIC_MODEL` | 否 | 空（沿用 `GEMINI_MODEL`） | agentic 模式专用模型；只有主模型不支持 agentic 时才需要设。调用时传了 `model` 则以它为准 |
-| `GEMINI_MODEL_ALIASES` | 否 | 空 | 额外的 `model` 别名，`alias=模型名,alias2=模型名2` |
 | `GEMINI_PAID_ONLY_MODELS` | 否 | `gemini-4` | 只走付费 key 的模型名前缀，逗号分隔 |
 | `GEMINI_MCP_HTTP_SECRET` | 仅 `--http` 模式必填 | 无 | HTTP 模式的唯一门锁；缺失或仍是占位符会被拒绝启动 |
 | `GEMINI_MCP_PUBLIC_BASE_URL` | 否 | 无（回退 `http://localhost:8768`） | 经隧道暴露后的公网地址，`get_upload_url` 用它拼上传地址 |
