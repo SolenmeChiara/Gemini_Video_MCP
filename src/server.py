@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import logging
@@ -51,6 +52,8 @@ from .config import (
     GEMINI_MCP_HTTP_SECRET,
     GEMINI_MCP_PUBLIC_BASE_URL,
     GEMINI_MODEL,
+    GEMINI_MODEL_ALIASES,
+    GEMINI_PAID_ONLY_MODELS,
     GEMINI_THINKING_LEVEL,
 )
 from .gemini_client import (
@@ -523,18 +526,20 @@ FREE_KEY_503_BACKOFF_SECONDS = (2.0,)  # 第 1 次 503/500 之后等多久再试
 FREE_KEY_COOLDOWN_SECONDS = 40 * 60  # 免费档失败（连续 503 或额度/权限被拒）后停用这么久，期间直接走付费档
 FREE_KEY_ATTEMPT_TIMEOUT_SECONDS = 120  # 免费档单次超过这么久不回就换付费档（免费档排队时常拖过 CC 的 300 秒静默上限）
 
-# 免费档停用到期的时刻（time.monotonic()），0 表示没在冷却。进程内共享，重启清零。
-_free_key_disabled_until: float = 0.0
+# 免费档停用到期的时刻（time.monotonic()），按模型分开记（免费额度按模型算，换模型的调用不连累默认模型）。
+# 进程内共享，重启清零。
+_free_key_disabled_until: dict[str, float] = {}
 
 
-def _free_key_cooling() -> bool:
-    return time.monotonic() < _free_key_disabled_until
+def _free_key_cooling(model: str = GEMINI_MODEL) -> bool:
+    return time.monotonic() < _free_key_disabled_until.get(model, 0.0)
 
 
-def _disable_free_key(reason: str) -> None:
-    global _free_key_disabled_until
-    _free_key_disabled_until = time.monotonic() + FREE_KEY_COOLDOWN_SECONDS
-    logger.info("免费档停用 %d 分钟（%s），期间公开内容直接走付费档", FREE_KEY_COOLDOWN_SECONDS // 60, reason)
+def _disable_free_key(reason: str, model: str = GEMINI_MODEL) -> None:
+    _free_key_disabled_until[model] = time.monotonic() + FREE_KEY_COOLDOWN_SECONDS
+    logger.info(
+        "模型 %s 的免费档停用 %d 分钟（%s），期间公开内容直接走付费档", model, FREE_KEY_COOLDOWN_SECONDS // 60, reason
+    )
 
 
 def _is_overloaded_error(e: GeminiVideoError) -> bool:
@@ -542,19 +547,24 @@ def _is_overloaded_error(e: GeminiVideoError) -> bool:
     return getattr(e, "status", None) in (500, 503)
 
 
-async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaitable[T]]) -> tuple[T, str]:
+async def _run_with_key_fallback(
+    key_tier: str, run: Callable[[str, str], Awaitable[T]], model: str = GEMINI_MODEL
+) -> tuple[T, str]:
     """按 key_tier 跑 run(api_key, tier)；免费档撞额度/权限、或连续 503 时用付费档整条重跑一次。
 
     整条重跑（而不是只重试生成那一步）是因为 Files API 上传的文件归属上传它的 key/项目，
     付费档看不到免费档传上去的文件，必须用付费 key 重新上传。上传缓存也按档位分开记。
     免费档 503 时同档重试（上传缓存命中，不重复上传），累计 FREE_KEY_503_MAX_ATTEMPTS 次仍 503 才换付费档。
     免费档一旦失败（连续 503 或额度/权限被拒），停用 FREE_KEY_COOLDOWN_SECONDS，期间的请求直接走付费档。
+    冷却按 model 分开记；仅付费档可用的模型（GEMINI_PAID_ONLY_MODELS）根本不碰免费档。
 
     Returns:
         (run 的返回值, 页脚用的档位标记 "free" / "paid" / "free→paid" / "paid（免费档冷却中）")
     """
+    if key_tier == "free" and GEMINI_API_KEY_FREE and _is_paid_only_model(model):
+        return await run(GEMINI_API_KEY, "paid"), "paid（该模型仅付费档）"
     if key_tier == "free" and GEMINI_API_KEY_FREE:
-        if _free_key_cooling():
+        if _free_key_cooling(model):
             return await run(GEMINI_API_KEY, "paid"), "paid（免费档冷却中）"
         for attempt in range(1, FREE_KEY_503_MAX_ATTEMPTS + 1):
             try:
@@ -562,22 +572,101 @@ async def _run_with_key_fallback(key_tier: str, run: Callable[[str, str], Awaita
                     run(GEMINI_API_KEY_FREE, "free"), timeout=FREE_KEY_ATTEMPT_TIMEOUT_SECONDS
                 ), "free"
             except TimeoutError:
-                _disable_free_key(f"单次超过 {FREE_KEY_ATTEMPT_TIMEOUT_SECONDS} 秒未返回")
+                _disable_free_key(f"单次超过 {FREE_KEY_ATTEMPT_TIMEOUT_SECONDS} 秒未返回", model)
                 break
             except GeminiVideoError as e:
                 if _is_free_quota_error(e):
-                    _disable_free_key(f"被拒，状态 {getattr(e, 'status', None)}")
+                    _disable_free_key(f"被拒，状态 {getattr(e, 'status', None)}", model)
                     break
                 if not _is_overloaded_error(e):
                     raise
                 if attempt >= FREE_KEY_503_MAX_ATTEMPTS:
-                    _disable_free_key(f"连续 {attempt} 次 503")
+                    _disable_free_key(f"连续 {attempt} 次 503", model)
                     break
                 delay = FREE_KEY_503_BACKOFF_SECONDS[min(attempt - 1, len(FREE_KEY_503_BACKOFF_SECONDS) - 1)]
                 logger.info("免费档第 %d 次 503，%.0f 秒后同档重试", attempt, delay)
                 await asyncio.sleep(delay)
         return await run(GEMINI_API_KEY, "paid"), "free→paid"
     return await run(GEMINI_API_KEY, "paid"), "paid"
+
+
+# ---------------------------------------------------------------------------
+# 按次选模型（工具的 model 参数）
+# ---------------------------------------------------------------------------
+_BUILTIN_MODEL_ALIASES: dict[str, str] = {
+    "argon": "gemini-4-argon",
+    "4": "gemini-4-argon",
+    "gemini-4": "gemini-4-argon",
+    "g4": "gemini-4-argon",
+    "flash": GEMINI_MODEL,
+    "default": GEMINI_MODEL,
+}
+_MODEL_ALIASES: dict[str, str] = {**_BUILTIN_MODEL_ALIASES, **GEMINI_MODEL_ALIASES}
+
+_KNOWN_MODELS_TTL_SECONDS = 3600
+_known_models_cache: tuple[float, list[str]] | None = None  # (取到的时刻 monotonic, 模型名列表)
+
+
+def _is_paid_only_model(model: str) -> bool:
+    return model.lower().startswith(GEMINI_PAID_ONLY_MODELS) if GEMINI_PAID_ONLY_MODELS else False
+
+
+async def _known_models() -> list[str]:
+    """通配符匹配用的候选模型表：models.list（缓存 1 小时）∪ 别名目标；列表拉不到就只用别名目标。"""
+    global _known_models_cache
+    names: list[str] = []
+    now = time.monotonic()
+    if _known_models_cache and now - _known_models_cache[0] < _KNOWN_MODELS_TTL_SECONDS:
+        names = list(_known_models_cache[1])
+    elif GEMINI_API_KEY:
+        try:
+            client = GeminiVideoClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL, timeout=30)
+            names = await client.list_models()
+            _known_models_cache = (now, list(names))
+        except Exception as e:  # noqa: BLE001 - 列表拉不到不致命，退回别名目标
+            logger.info("models.list 失败，通配符只在别名目标里匹配：%s", e)
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in [*names, *_MODEL_ALIASES.values()]:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _alias_help() -> str:
+    pairs = sorted(_MODEL_ALIASES.items())
+    return "、".join(f"{a} → {m}" for a, m in pairs)
+
+
+async def _resolve_model(raw: str | None) -> tuple[str | None, str | None]:
+    """把工具的 model 参数解析成真实模型名。返回 (模型名, None) 或 (None, 中文错误)。
+
+    空 → GEMINI_MODEL；别名（不分大小写）；含 * 的通配符在已知模型里 fnmatch，恰好一个才用；
+    gemini- 开头的原样透传（可带 models/ 前缀）。
+    """
+    value = (raw or "").strip()
+    if not value:
+        return GEMINI_MODEL, None
+    value = value.removeprefix("models/").strip()
+    alias = _MODEL_ALIASES.get(value.lower())
+    if alias:
+        return alias, None
+    if "*" in value:
+        pattern = value.lower()
+        matches = [m for m in await _known_models() if fnmatch.fnmatchcase(m.lower(), pattern)]
+        if len(matches) == 1:
+            return matches[0], None
+        if not matches:
+            return None, f"model 通配符「{value}」没有匹配到任何已知模型。可用别名：{_alias_help()}。"
+        shown = "、".join(matches[:25]) + (f" 等共 {len(matches)} 个" if len(matches) > 25 else "")
+        return None, f"model 通配符「{value}」匹配到多个模型，请写得更具体：{shown}"
+    if value.lower().startswith("gemini-"):
+        return value, None
+    return None, (
+        f"不认识的模型「{value}」。可传 gemini- 开头的完整模型名、带 * 的通配符，或这些别名：{_alias_help()}。"
+        "留空则用默认模型。"
+    )
 
 
 def _api_key_for_tier(key_tier: str) -> str:
@@ -755,7 +844,7 @@ async def _get_or_upload_file(
         if tier == key_tier:
             await client.delete_file(name)
         else:
-            other = GeminiVideoClient(api_key=_api_key_for_tier(tier), model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+            other = GeminiVideoClient(api_key=_api_key_for_tier(tier), model=client.model, base_url=GEMINI_BASE_URL)
             await other.delete_file(name)
 
     return file_uri, False
@@ -803,8 +892,11 @@ def _format_describe_result(
     本地文件、直链下载、YouTube 直读三条入口都共用这一段，保证页脚格式与措辞一致。
     processing 是这次实际走的处理方式说明（static / agentic / 细看区间等），会写进用量那一行。
     notes 里放回退原因之类需要让用户看见的提醒。key_label 是这次实际出力的 key 档位（free / paid / free→paid）。
+    result["model"]（有的话）是实际作答的模型，写进页脚。
     """
     key_part = f"；key：{key_label}" if key_label else ""
+    if result.get("model"):
+        key_part = f"；模型：{result['model']}{key_part}"
     text = result["text"]
     footer_lines: list[str] = []
     if result.get("truncated"):
@@ -827,8 +919,10 @@ def _format_describe_result(
     return text
 
 
-def _agentic_model() -> str:
-    """agentic 路径实际用的模型：配了 GEMINI_AGENTIC_MODEL 就用它，否则沿用主模型。"""
+def _agentic_model(model: str = GEMINI_MODEL) -> str:
+    """agentic 路径实际用的模型：调用方换了模型就用它；否则配了 GEMINI_AGENTIC_MODEL 用它，再否则沿用主模型。"""
+    if model != GEMINI_MODEL:
+        return model
     return GEMINI_AGENTIC_MODEL or GEMINI_MODEL
 
 
@@ -859,7 +953,7 @@ async def _run_static_generate(
         # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
         if "thinking level" not in str(e).lower():
             raise
-        logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", GEMINI_MODEL, GEMINI_THINKING_LEVEL)
+        logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", client.model, GEMINI_THINKING_LEVEL)
         return await client.describe_video(
             video_bytes=video_bytes,
             prompt=final_prompt,
@@ -886,6 +980,7 @@ async def _describe_video_bytes(
     fps: float | None = None,
     mode_note: str | None = None,
     key_tier: str = "paid",
+    model: str = GEMINI_MODEL,
 ) -> str:
     """识别管线的共享核心：拿到【视频字节 + MIME】后，组装提示词、调用 Gemini、拼装中文返回文本。
 
@@ -898,6 +993,7 @@ async def _describe_video_bytes(
       跑不通时自动回退 static，并把原因写进页脚。
     - detail_range/fps：只看某一段（「细看」），走 videoMetadata，恒定 static。
     - key_tier："free" 表示公开内容、先走免费档 key，撞额度/权限时整条换付费档重跑（见 _run_with_key_fallback）。
+    - model：已由 _resolve_model 解析好的模型名，本次调用的所有客户端都用它（不改模块全局）。
     """
     final_prompt, effective_tokens = _build_final_prompt_and_tokens(
         prompt, persona, hint, max_output_tokens, detail_range
@@ -906,7 +1002,7 @@ async def _describe_video_bytes(
 
     async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
         # 每档 key 各跑一遍完整流程（上传 → agentic/static），notes 与 mode 都从头算，免得回退残留串档。
-        client = GeminiVideoClient(api_key=api_key, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+        client = GeminiVideoClient(api_key=api_key, model=model, base_url=GEMINI_BASE_URL)
         notes: list[str] = [mode_note] if mode_note else []
         cur_mode = mode
         result: dict | None = None
@@ -931,9 +1027,9 @@ async def _describe_video_bytes(
                     prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
                     file_uri=file_uri,
                     mime_type=mime_type,
-                    model=_agentic_model(),
+                    model=_agentic_model(model),
                 )
-                processing = f"agentic（模型 {result.get('model')}）"
+                processing = "agentic"
             except GeminiVideoError as e:
                 if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
                     raise
@@ -955,10 +1051,11 @@ async def _describe_video_bytes(
             if detail_range:
                 fps_note = f"，fps={fps:g}" if fps else ""
                 processing = f"static（细看 {detail_range[0]:g}s–{detail_range[1]:g}s{fps_note}）"
+        result.setdefault("model", client.model)
         return result, processing, notes
 
     try:
-        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run)
+        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run, model)
     except GeminiVideoError as e:
         return f"视频识别失败：{e}"
     except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
@@ -979,6 +1076,7 @@ async def _describe_youtube_url(
     mode: str = "static",
     mode_note: str | None = None,
     key_tier: str = "paid",
+    model: str = GEMINI_MODEL,
 ) -> str:
     """YouTube 视频页直读的共享核心：组装提示词、调用 Gemini 云端直读、拼装中文返回文本。
 
@@ -991,7 +1089,7 @@ async def _describe_youtube_url(
     final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
 
     async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
-        client = GeminiVideoClient(api_key=api_key, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL)
+        client = GeminiVideoClient(api_key=api_key, model=model, base_url=GEMINI_BASE_URL)
         notes: list[str] = [mode_note] if mode_note else []
         if mode == "agentic":
             # YouTube 直读也能进 agentic：uri 直接给视频页链接，不带 mime_type。
@@ -1000,9 +1098,9 @@ async def _describe_youtube_url(
                     prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
                     file_uri=youtube_url,
                     mime_type=None,
-                    model=_agentic_model(),
+                    model=_agentic_model(model),
                 )
-                return result, f"agentic（模型 {result.get('model')}）", notes
+                return result, "agentic", notes
             except GeminiVideoError as e:
                 if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
                     raise
@@ -1020,7 +1118,7 @@ async def _describe_youtube_url(
             # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
             if "thinking level" not in str(e).lower():
                 raise
-            logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", GEMINI_MODEL, GEMINI_THINKING_LEVEL)
+            logger.info("模型 %s 不支持 thinking_level=%s，自动改用 low 重试", client.model, GEMINI_THINKING_LEVEL)
             result = await client.describe_youtube(
                 youtube_url,
                 final_prompt,
@@ -1028,10 +1126,11 @@ async def _describe_youtube_url(
                 max_output_tokens=effective_tokens,
                 thinking_level="low",
             )
+        result.setdefault("model", client.model)
         return result, "static", notes
 
     try:
-        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run)
+        (result, processing, notes), key_label = await _run_with_key_fallback(key_tier, _run, model)
     except GeminiVideoError as e:
         return f"视频识别失败：{e}"
     except Exception as e:  # noqa: BLE001 - 兜底：任何异常都不许裸抛出 MCP 边界
@@ -1284,6 +1383,7 @@ async def describe_video(
     start: float | str | None = None,
     end: float | str | None = None,
     fps: float | None = None,
+    model: str = "",
 ) -> str:
     """把本地视频交给 Gemini 直传识别，返回按时间轴分段的详细内容描述（画面 + 音轨）。
 
@@ -1309,14 +1409,21 @@ async def describe_video(
         start: 只看某一段的起点，秒数或 "1:06" 写法。给了 start/end 就进"细看"（强制 static，只把这一段喂给模型）。
         end: 只看某一段的终点；只给 start 时默认往后看 30 秒。
         fps: 细看时的抽帧率（默认 1，上限 10）。调高能抓住快动作，token 也按倍数涨。
+        model: 可选，本次改用哪个 Gemini 模型；留空 = 默认模型（.env 的 GEMINI_MODEL）。
+            别名不分大小写：argon / 4 / gemini-4 / g4 → gemini-4-argon（仅付费档）；flash / default → 默认模型。
+            也可传 gemini- 开头的完整模型名，或带 * 的通配符（如 "gemini-4*"，恰好匹配一个才用）。
 
     Returns:
         Gemini 生成的视频内容描述文本（末尾可能带用量统计或截断提示）。
     """
-    # 1) API key
+    # 1) API key + 模型
     err = _check_api_key()
     if err:
         return err
+    resolved_model, err = await _resolve_model(model)
+    if err:
+        return err
+    assert resolved_model is not None
 
     # 2) 文件校验
     p, err = _validate_local_file(path)
@@ -1378,6 +1485,7 @@ async def describe_video(
         fps=fps_value,
         mode_note=mode_note,
         key_tier=_key_tier_for_path(p),
+        model=resolved_model,
     )
 
 
@@ -1395,6 +1503,7 @@ async def describe_video_url(
     low_resolution: bool = False,
     max_output_tokens: int = 30000,
     mode: str = "auto",
+    model: str = "",
 ) -> str:
     """从【网络直链】下载、或从【YouTube 视频页】云端直读视频再交给 Gemini 识别，返回按时间轴分段的中文描述。
 
@@ -1419,6 +1528,9 @@ async def describe_video_url(
         max_output_tokens: 最大输出 token，默认 30000（内部有 2048 下限保护）。
         mode: 处理方式，含义同 describe_video："auto"（默认，≥5 分钟走 agentic）/"static"/"agentic"。
             YouTube 链接读不到时长，auto 一律按 static 处理。
+        model: 可选，本次改用哪个 Gemini 模型；留空 = 默认模型（.env 的 GEMINI_MODEL）。
+            别名不分大小写：argon / 4 / gemini-4 / g4 → gemini-4-argon（仅付费档）；flash / default → 默认模型。
+            也可传 gemini- 开头的完整模型名或带 * 的通配符。
 
     Returns:
         Gemini 生成的视频描述文本（末尾可能带用量统计或截断提示）。
@@ -1428,6 +1540,10 @@ async def describe_video_url(
         return err
     if not url or not url.strip():
         return "没有提供链接。请把视频文件的 http/https 直链传给 url 参数。"
+    resolved_model, err = await _resolve_model(model)
+    if err:
+        return err
+    assert resolved_model is not None
 
     # YouTube 视频页：走 Gemini 云端直读通道（file_data.file_uri 直传，服务器不下载）。
     # _describe_youtube_url 内部已兜住所有异常、绝不裸抛出 MCP 边界。
@@ -1444,6 +1560,7 @@ async def describe_video_url(
             mode=yt_mode,
             mode_note=yt_note,
             key_tier="free",
+            model=resolved_model,
         )
 
     temp_path, mime_type, err = await _download_to_temp(url.strip())
@@ -1468,6 +1585,7 @@ async def describe_video_url(
             mode=resolved_mode,
             mode_note=mode_note,
             key_tier="free",
+            model=resolved_model,
         )
     except Exception as e:  # noqa: BLE001 - 任何异常都不许裸抛出 MCP 边界
         logger.exception("describe_video_url 未预期异常")
@@ -1526,13 +1644,15 @@ def _fmt_tokens(n: float) -> str:
 
 
 @mcp.tool(annotations=READONLY, structured_output=False)
-async def estimate_cost(path: str) -> str:
+async def estimate_cost(path: str, model: str = "") -> str:
     """估算把某个本地视频交给 Gemini 识别大概要花多少输入 token，让你发大视频前心里有数。
 
     优先用 ffprobe 读真实时长；读不到（没装 ffprobe / 格式怪）则按文件大小粗估并注明。
 
     Args:
         path: 本地视频文件路径。
+        model: 可选，打算用哪个模型（写法同 describe_video 的 model）；只用来在结果里标明模型与付费档，
+            token 估算本身不随模型变（单价因模型而异）。
 
     Returns:
         一段中文预估说明（文件大小、时长、标清/低清 token 估算、上传通道）。
@@ -1541,6 +1661,10 @@ async def estimate_cost(path: str) -> str:
     if err:
         return err
     assert p is not None
+    resolved_model, err = await _resolve_model(model)
+    if err:
+        return err
+    assert resolved_model is not None
 
     # 顺带校验格式，让用户尽早发现“这个格式不支持”。
     try:
@@ -1576,6 +1700,7 @@ async def estimate_cost(path: str) -> str:
             f"文件大小：{size_mb:.1f} MB（{size_bytes:,} 字节）",
             duration_note,
             f"上传通道：{channel}（内联阈值 14MB）",
+            f"模型：{resolved_model}" + ("（仅付费档，不走免费 key）" if _is_paid_only_model(resolved_model) else ""),
             "",
             f"输入 token 估算（基于{est_source}）：",
             f"  - 标清（约 300 token/秒）：{_fmt_tokens(tokens_standard)}",

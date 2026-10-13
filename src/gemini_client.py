@@ -406,7 +406,8 @@ class GeminiVideoClient:
             )
         if status == 404:
             raise GeminiVideoError(
-                f"找不到模型或资源（404）。请检查 GEMINI_MODEL（当前：{self.model}）是否拼写正确、是否可用。"
+                f"找不到模型或资源（404）。请检查模型名（当前：{self.model}，"
+                "来自 GEMINI_MODEL 或工具的 model 参数）是否拼写正确、是否可用。"
                 f"\n服务端说明：{snippet}",
                 status=status,
             )
@@ -429,7 +430,8 @@ class GeminiVideoClient:
         - 网络层 aiohttp.ClientError 最多重试 3 次（每次间隔 1 秒）；
         - HTTP 状态码错误（4xx/5xx）立即失败、不重试，并翻译成中文。
         """
-        url = f"{self.base_url}/{endpoint}?key={self.api_key}"
+        sep = "&" if "?" in endpoint else "?"
+        url = f"{self.base_url}/{endpoint}{sep}key={self.api_key}"
 
         max_retries = 3
         last_exception: Exception | None = None
@@ -563,6 +565,22 @@ class GeminiVideoClient:
         注意：这条路径【不】负责删除远端文件，删不删由调用方决定（Google 侧 48 小时后自动清理）。
         """
         return await self._upload_file_and_wait_active(data, mime_type, display_name)
+
+    async def list_models(self) -> list[str]:
+        """models.list：返回这把 key 能看到的全部模型名（去掉 "models/" 前缀），自动翻页。"""
+        names: list[str] = []
+        token = ""
+        for _page in range(20):
+            endpoint = "models?pageSize=1000" + (f"&pageToken={token}" if token else "")
+            data = await self._request_json("GET", endpoint)
+            for item in data.get("models") or []:
+                name = str(item.get("name") or "").removeprefix("models/")
+                if name:
+                    names.append(name)
+            token = str(data.get("nextPageToken") or "")
+            if not token:
+                break
+        return names
 
     async def get_file_info(self, file_name: str) -> dict | None:
         """查询 Files API 上某个文件的元信息（state / expirationTime 等）；查不到或出错返回 None。

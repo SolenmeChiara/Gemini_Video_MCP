@@ -19,6 +19,7 @@ flatter tone or a different output language, pass your own `prompt`.
   - **Also handles `.gif` natively** (sent as raw `image/gif`, so Gemini perceives the full animation instead of a single extracted frame);
   - Small videos (≤14MB) go inline in a single request; larger ones automatically go through the Files API (upload → wait until ready → describe → delete the remote copy when done), up to a 2GB per-file limit;
   - `low_resolution` is a cost-saving switch; `persona` lets Gemini narrate in character; `hint` lets you feed in what a human already thinks the video is about, useful for abstract or meme-y content (the model is instructed to still describe what it actually sees, not just agree with you); `prompt` fully overrides the built-in template.
+  - `model` (optional, also on `describe_video_url` / `estimate_cost`) picks a Gemini model for this call; empty = `GEMINI_MODEL`. Aliases (case-insensitive): `argon` / `4` / `gemini-4` / `g4` → `gemini-4-argon` (paid tier only, skips the free key), `flash` / `default` → `GEMINI_MODEL`. Any `gemini-…` id passes through; a value with `*` (e.g. `gemini-4*`) is matched against `models.list` and used only if exactly one model matches. The footer names the model that answered.
 - **`describe_video_url`** — downloads a video from a **direct link** and runs it through the same pipeline (downloaded to a temp folder, deleted right after).
   - Same parameters as `describe_video`, just `path` becomes `url`;
   - **Only works with direct video file links** (something that resolves straight to a video file, ending in `.mp4/.mov/.webm`/etc.). Platform *watch pages* (YouTube, TikTok, Bilibili, etc.) are **not** direct links and won't resolve — that would need something like yt-dlp, which is out of scope for now;
@@ -64,7 +65,9 @@ You can also skip `.env` entirely and inject the key at registration time with `
 | `GEMINI_MODEL` | No | `gemini-3.5-flash` | Model identifier |
 | `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta` | API base URL; only change this if you're proxying |
 | `GEMINI_THINKING_LEVEL` | No | `high` | One of `minimal`/`low`/`medium`/`high`; set `minimal` to save cost |
-| `GEMINI_AGENTIC_MODEL` | No | empty (falls back to `GEMINI_MODEL`) | Model used for agentic mode; only needed when the main model doesn't support it |
+| `GEMINI_AGENTIC_MODEL` | No | empty (falls back to `GEMINI_MODEL`) | Model used for agentic mode; only needed when the main model doesn't support it. Ignored when a call passes its own `model` |
+| `GEMINI_MODEL_ALIASES` | No | empty | Extra `model` aliases, `alias=model-id,alias2=model-id2` |
+| `GEMINI_PAID_ONLY_MODELS` | No | `gemini-4` | Comma-separated model-name prefixes that always use the paid key |
 | `GEMINI_MCP_HTTP_SECRET` | Only for `--http` mode | — | The sole access lock for HTTP mode; server refuses to start without a real value |
 | `GEMINI_MCP_PUBLIC_BASE_URL` | No | none (falls back to `http://localhost:8768`) | Public URL after tunneling; used by `get_upload_url` to build the upload link |
 

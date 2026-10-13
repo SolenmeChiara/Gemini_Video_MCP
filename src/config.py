@@ -75,6 +75,25 @@ GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.
 # 只有部分模型支持 processing="agentic"；主模型不支持时在这里指定一个支持的（static 路径仍用 GEMINI_MODEL）。
 GEMINI_AGENTIC_MODEL: str = os.getenv("GEMINI_AGENTIC_MODEL", "").strip()
 
+# 按次换模型（工具的 model 参数）用的额外别名：逗号分隔的 alias=模型名，如 "pro=gemini-3.5-pro,a=gemini-4-argon"。
+# 与内置别名（argon/4/gemini-4/g4 → gemini-4-argon；flash/default → GEMINI_MODEL）合并，同名时这里优先。
+def _parse_aliases(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        alias, sep, target = pair.partition("=")
+        alias, target = alias.strip().lower(), target.strip()
+        if sep and alias and target:
+            out[alias] = target.removeprefix("models/")
+    return out
+
+
+GEMINI_MODEL_ALIASES: dict[str, str] = _parse_aliases(os.getenv("GEMINI_MODEL_ALIASES", ""))
+
+# 只有付费档能调的模型（前缀匹配，逗号分隔）：命中时跳过免费档 key 直接用付费 key。
+GEMINI_PAID_ONLY_MODELS: tuple[str, ...] = tuple(
+    p.strip().lower() for p in os.getenv("GEMINI_PAID_ONLY_MODELS", "gemini-4").split(",") if p.strip()
+)
+
 # 思考等级：默认 high——实测思考越多文学发挥越好（sol 钦点"对 flash 慷慨点"）。
 # 想省钱可在 .env 里改成 minimal。有效值 minimal/low/medium/high；
 # 模型不支持时服务器会自动降级为 low 重试一次。
