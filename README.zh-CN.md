@@ -7,7 +7,8 @@
 
 Gemini 描述视频的效果非常好——好到会自由发挥出戏剧张力和抒情感。本服务器的默认提示词
 **刻意保留了这种自由发挥**（不禁止抒情、不要求客观简洁），并要求用**中文**输出；
-要压制文风或换成别的语言请自己传 `prompt`。
+固定模板和四条硬规则放在 API 的系统指令字段里；`prompt` 只作为额外要求追加在视频之后（比如「只关注声音」），
+可以调整关注点和写法，但不会把硬规则冲掉。
 
 ## 能力一览
 
@@ -15,7 +16,7 @@ Gemini 描述视频的效果非常好——好到会自由发挥出戏剧张力�
   - 支持 `mp4 / mov / webm / avi / mkv / flv / wmv / mpeg / mpg / m4v / 3gp / 3gpp` 等常见视频格式；
   - **也直接支持 `.gif`**（以 `image/gif` 原格式直传，Gemini 能感知完整动画，不抽帧）；
   - 小视频（≤14MB）内联上传、单次完成；大视频自动走 Files API（上传→等待就绪→识别→用完删除远端文件），单文件上限 2GB；
-  - `low_resolution` 低清省钱开关；`persona` 可让 Gemini 附体任意人格来解说；`hint` 可注入人类对视频的已有形容作为理解线索（适合抽象/玩梗内容，模型仍以实际所见为准）；`prompt` 完全自定义。
+  - `prompt`：额外要求或背景描述（人类对视频的形容、想重点看什么），只追加在内置模板之后、不替换它，模型仍以实际所见所闻为准；`hint` 是它的弃用别名。`low_resolution` 发 `mediaResolution=LOW`，在 Gemini 3/4 上与默认同档（70 token/帧），基本不省钱。
   - `model`（可选，`describe_video_url` / `estimate_cost` 也有）：本次换哪个 Gemini 模型，填模型识别符，留空用 `GEMINI_MODEL`；带 `*` 的在 `models.list` 里匹配，恰好一个才用。仅付费档的模型（`GEMINI_PAID_ONLY_MODELS`）跳过免费 key。页脚会写明实际作答的模型。
 - `describe_video_url` —— 从**网络直链**下载视频再识别（下载到临时目录、识别完即删）。
   - 参数与 `describe_video` 完全一致，只是把 `path` 换成 `url`；
@@ -226,8 +227,7 @@ print(resp.json())
 ## 用法示例（在对话里）
 
 - "帮我描述一下 `D:/videos/monkey.mp4` 这个视频" → 触发 `describe_video`。
-- "用一个毒舌女高中生的口吻讲讲 `D:/videos/dance.mp4`" → Claude 会带上 `persona`。
-- "这个视频是在用鸡蛋下五子棋，帮我描述 `D:/videos/eggs.mp4`" → Claude 会把你的形容放进 `hint`，帮模型看懂抽象整活。
+- "这个视频是在用鸡蛋下五子棋，帮我描述 `D:/videos/eggs.mp4`" → Claude 会把你的形容放进 `prompt`，帮模型看懂抽象整活。
 - "帮我描述这个直链视频 `https://example.com/clip.mp4`" → 触发 `describe_video_url`（先下载再识别）。
 - "给我看看 `D:/videos/monkey.mp4` 第 8 秒长什么样" → 触发 `view_media`（抽第 8 秒那一帧给 Claude 亲眼看）。
 - "把 `D:/pics/meme.png` 这张图给你自己看看" → 触发 `view_media`（直接把图投给 Claude）。
@@ -251,7 +251,7 @@ agentic 需要视频先落到 Files API（小视频也会被传一次）；跑�
 **细看**：`describe_video` 另外接受 `start` / `end` / `fps`，只把这一段喂给模型（此时恒定 static）。
 
 - 时间写秒数（`39`）或 `分:秒`（`1:06`）都行；只给 `start` 时默认往后看 30 秒；`fps` 默认 1、上限 10；
-- `hint` 写成问句（问号结尾或含疑问词）就针对这一段回答问题，否则按秒级时间戳细讲这一段的动作、声音、字幕；
+- `prompt` 写成问句（问号结尾或含疑问词）就针对这一段回答问题，否则按秒级时间戳细讲这一段的动作、声音、字幕；
 - 返回的时间戳仍是原视频的绝对时间。
 
 **上传缓存**：走 Files API 的视频按内容 sha256 记进 `temp_media/upload_cache.json`，48 小时内再看同一个文件直接复用远端文件、不重传（复用前查一次文件状态，失效就重传）。所以「先整体看一遍，再回头细看某几秒」只上传一次。
@@ -267,7 +267,7 @@ Gemini 按视频时长计输入 token：
 | 标清（默认） | 约 **300 token/秒** | 约 **1.8 万**输入 token | 画面细节更足 |
 | 低清（`low_resolution=True`） | 约 **100 token/秒** | 约 **0.6 万**输入 token | 长视频省钱，细节变粗 |
 
-以上只是**输入** token；输出 token 另计，取决于描述长短。发大视频前可先用 `estimate_cost` 心里有数。
+这是旧版数字。按 Google media-resolution 文档，Gemini 3/4 的视频帧在默认/low/medium 下都是 70 token/帧，high 才是 280，所以默认模型上每分钟约 6–7k 输入 token、开不开低清差不多（50 秒片段在 3.8-flash 实测约 5.7k）。以上只是**输入** token；输出 token 另计，取决于描述长短。发大视频前可先用 `estimate_cost` 心里有数。
 
 ## 关于 thinking token 的坑（已内建对策）
 
@@ -277,7 +277,8 @@ Gemini 3.5 的"思考"token 也计入 `maxOutputTokens`。如果输出预算太�
 本服务器默认 `thinking_level=high`（实测思考越多、描述的文学发挥越好），并相应把默认
 `max_output_tokens` 设为 8192 给思考留足余量；检测到截断时会在结果末尾追加提示。
 想省钱可在 `.env` 里设 `GEMINI_THINKING_LEVEL=minimal`（思考 token 按输出计费）。
-模型不支持当前思考等级时会自动降级为 `low` 重试一次。
+模型不支持当前思考等级时会自动降级为 `low` 重试一次。Gemini 4 Argon 和 3.8 Flash 只有 low/medium/high，`minimal` 会直接按 `low` 发。
+采样参数（temperature/topK/topP）只发给 3.5 之前的老模型，新模型官方写明会忽略。
 
 ## 已知限制
 

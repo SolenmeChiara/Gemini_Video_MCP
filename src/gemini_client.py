@@ -18,7 +18,11 @@
        预算吃光导致描述被截断。对策：客户端层默认 thinking_level="minimal"（MCP 服务器
        实际传入 GEMINI_THINKING_LEVEL 配置值，未配置时为 high），输出 token 下限 2048，
        检测到 finishReason == "MAX_TOKENS" 时在返回文本末尾追加告警。
-    3. 低清模式：mediaResolution 低清约 100 token/秒，标清约 300 token/秒，长视频省钱开关。
+    3. 低清模式：generationConfig.mediaResolution=LOW。官方 media-resolution 文档：Gemini 3/4 的视频帧
+       在 unspecified/low/medium 下都是 70 token/帧（约 100 token/秒含音轨），high 才是 280 token/帧，
+       所以在新模型上这个开关基本不再省钱，只对老模型有意义。
+    5. 固定模板走 systemInstruction（generateContent）/ system_instruction（Interactions），
+       用户回合只放「视频 part → 简短请求/额外要求」，顺序按官方「text 放在视频之后」。
     4. GIF 原格式直传：Gemini 能以 image/gif 感知完整动画，GIF 不要抽帧转 jpg。
 """
 
@@ -54,8 +58,46 @@ INTERACTIONS_ENDPOINT = "interactions"
 THINKING_LEVEL_MINIMAL = "minimal"
 VALID_THINKING_LEVELS = ["minimal", "low", "medium", "high"]
 
-# Gemini 3.5 起官方弃用采样参数（temperature/topP/topK），发送虽不报错但强烈不建议。
-_NO_SAMPLING_MODEL_PREFIXES = ("gemini-3.5",)
+# 官方 thinking 文档的模型表：gemini-4-argon / gemini-3.8-flash 只有 low/medium/high（没有 minimal）。
+# 命中这些前缀时把 minimal 就地抬成 low，省一次 400 + 降级重试（服务器层的自动降级仍作兜底）。
+_NO_MINIMAL_THINKING_PREFIXES = ("gemini-4", "gemini-3.8")
+
+# 采样参数（temperature/topP/topK）：官方 generateContent 参考写明
+# 「This field is no longer supported and is silently ignored on Gemini 3.6 Flash and newer models」，
+# text-generation 指南补充 Gemini 4 / 3.6+ 会回弃用警告头、要求「Remove these sampling parameters」。
+# 3.5 起的官方指南就已不建议发。版本号 >= 3.5、或读不出版本号（*-latest 之类别名，指向的都是新模型）一律不发。
+_SAMPLING_MAX_VERSION = (3, 5)
+_MODEL_VERSION_RE = re.compile(r"^gemini-(\d+)(?:\.(\d+))?")
+
+
+def _model_accepts_sampling(model_identifier: str) -> bool:
+    """只有明确是 3.5 之前的老模型才发采样参数（沿用原 bot 视频链路的低温设定）。"""
+    m = _MODEL_VERSION_RE.match((model_identifier or "").strip().lower())
+    if not m:
+        return False
+    version = (int(m.group(1)), int(m.group(2) or 0))
+    return version < _SAMPLING_MAX_VERSION
+
+
+def _effective_thinking_level(thinking_level: str | None, model_identifier: str) -> str | None:
+    """按模型家族修正思考等级：不支持 minimal 的家族改用 low。"""
+    if thinking_level == THINKING_LEVEL_MINIMAL and (model_identifier or "").lower().startswith(
+        _NO_MINIMAL_THINKING_PREFIXES
+    ):
+        return "low"
+    return thinking_level
+
+
+def _system_instruction_content(system_instruction: str | None) -> dict[str, Any] | None:
+    """generateContent 的 systemInstruction 是一个 Content（只认 text part）；空串返回 None 不发。"""
+    if not system_instruction or not system_instruction.strip():
+        return None
+    return {"parts": [{"text": system_instruction}]}
+
+
+def inline_system_text(system_instruction: str, user_text: str) -> str:
+    """没有系统指令字段可用时的退路：把模板用醒目的分隔标记放在用户文字前面。"""
+    return f"【系统指令开始】\n{system_instruction.strip()}\n【系统指令结束】\n\n{user_text}"
 
 # 安全阈值全开，避免视频里无伤大雅的内容被拦截导致空响应。
 GEMINI_SAFETY_SETTINGS = [
@@ -126,19 +168,20 @@ def _build_generation_config(
     """构建 Gemini 的 generationConfig。
 
     - maxOutputTokens：注意思考 token 也算在这里面。
-    - Gemini 3.5 起弃用采样参数，这里对 3.5 系列不发送 temperature/topP/topK。
+    - 采样参数只对 3.5 之前的老模型发送（见 _model_accepts_sampling）。
     - thinking_level：由调用方传入（MCP 服务器传 GEMINI_THINKING_LEVEL 配置值，未配置时 high；
-      客户端方法自身默认 minimal），无效值忽略并告警。
-    - low_resolution：开低清（约 100 token/秒），长视频省钱。
+      客户端方法自身默认 minimal），按模型家族修正后写进 thinkingConfig，无效值忽略并告警。
+    - low_resolution：generationConfig.mediaResolution=LOW（Gemini 3/4 上与默认同档，见模块说明）。
     """
     config: dict[str, Any] = {"maxOutputTokens": max_output_tokens}
 
-    # 旧模型（非 3.5）保留低温采样，行为与原 bot 视频链路一致（temperature=0.3）。
-    if not model_identifier.startswith(_NO_SAMPLING_MODEL_PREFIXES):
+    # 老模型保留低温采样，行为与原 bot 视频链路一致（temperature=0.3）。
+    if _model_accepts_sampling(model_identifier):
         config["temperature"] = 0.3
         config["topK"] = 1
         config["topP"] = 1
 
+    thinking_level = _effective_thinking_level(thinking_level, model_identifier)
     if thinking_level:
         if thinking_level in VALID_THINKING_LEVELS:
             config["thinkingConfig"] = {"thinkingLevel": thinking_level}
@@ -623,6 +666,7 @@ class GeminiVideoClient:
         thinking_level: str = THINKING_LEVEL_MINIMAL,
         file_uri: str | None = None,
         video_metadata: dict[str, Any] | None = None,
+        system_instruction: str | None = None,
     ) -> dict[str, Any]:
         """把整个视频（含音轨）直接交给 Gemini 分析并返回描述。
 
@@ -632,7 +676,8 @@ class GeminiVideoClient:
           既不再上传、也【不】删除它（生命周期归调用方管），此时 video_bytes 可以传空字节；
         - video_metadata：只看视频的一段/换抽帧率时传，形如
           {"start_offset": "39s", "end_offset": "46s", "fps": 5}，原样塞进这个 part；
-        - low_resolution=True 时用低媒体分辨率（约 100 token/秒 vs 标清约 300 token/秒）。
+        - low_resolution=True 时发 mediaResolution=LOW；
+        - system_instruction：固定模板，走请求体的 systemInstruction；prompt 只是用户回合里视频之后的那段文字。
 
         Returns:
             dict: {
@@ -665,6 +710,8 @@ class GeminiVideoClient:
             video_part = {"file_data": {"mime_type": mime_type, "file_uri": uploaded_uri}}
 
         # 只看某一段 / 换抽帧率：videoMetadata 挂在视频这个 part 上。
+        # 官方参考把 VideoMetadata 标了 deprecated（指向 GenerateContentRequest.processing_options），
+        # 但请求体字段表里还没有 processing_options，videoMetadata 仍是 generateContent 唯一可用的裁剪/帧率写法。
         if video_metadata:
             video_part["video_metadata"] = dict(video_metadata)
 
@@ -675,11 +722,14 @@ class GeminiVideoClient:
             low_resolution=low_resolution,
         )
 
-        request_data = {
+        request_data: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [video_part, {"text": prompt}]}],
             "generationConfig": generation_config,
             "safetySettings": GEMINI_SAFETY_SETTINGS,
         }
+        system_content = _system_instruction_content(system_instruction)
+        if system_content:
+            request_data["systemInstruction"] = system_content
 
         try:
             endpoint = f"models/{self.model}:generateContent"
@@ -718,6 +768,7 @@ class GeminiVideoClient:
         low_resolution: bool = False,
         max_output_tokens: int = 4096,
         thinking_level: str = THINKING_LEVEL_MINIMAL,
+        system_instruction: str | None = None,
     ) -> dict[str, Any]:
         """把 YouTube 视频页链接交给 Gemini 云端直读并返回描述（不下载、不走 Files API）。
 
@@ -748,11 +799,14 @@ class GeminiVideoClient:
             low_resolution=low_resolution,
         )
 
-        request_data = {
+        request_data: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [video_part, {"text": prompt}]}],
             "generationConfig": generation_config,
             "safetySettings": GEMINI_SAFETY_SETTINGS,
         }
+        system_content = _system_instruction_content(system_instruction)
+        if system_content:
+            request_data["systemInstruction"] = system_content
 
         endpoint = f"models/{self.model}:generateContent"
         response_data = await self._request_json("POST", endpoint, request_data)
@@ -788,6 +842,7 @@ class GeminiVideoClient:
         file_uri: str,
         mime_type: str | None = None,
         model: str | None = None,
+        system_instruction: str | None = None,
     ) -> dict[str, Any]:
         """走 Interactions API 的 agentic 模式识别视频（模型自行决定看哪段、什么帧率、要不要听音轨）。
 
@@ -799,6 +854,10 @@ class GeminiVideoClient:
             file_uri: 视频地址——Files API 上传后拿到的 uri，或公开的 YouTube 视频页链接。
             mime_type: 视频 MIME；YouTube 链接不要传（服务端自行识别）。
             model: 覆盖本客户端的默认模型（agentic 不是所有模型都支持，可单独指定）。
+            system_instruction: 固定模板。Interactions 的 system_instruction 是请求体顶层的纯字符串；
+                服务端若拒收这个字段（400 且报错提到 system_instruction），自动改成把模板用分隔标记
+                放在 input 文本最前面重发一次，返回 dict 的 "system_path" 标出实际走了哪条
+                （"system_instruction" / "inline" / None=没传模板）。
 
         Returns:
             与 describe_video 同构的 dict，channel 固定为 "interactions"，
@@ -813,12 +872,25 @@ class GeminiVideoClient:
         if mime_type:
             video_input["mime_type"] = mime_type
 
-        request_data = {
+        request_data: dict[str, Any] = {
             "model": used_model,
             "input": [video_input, {"type": "text", "text": prompt}],
         }
+        system_path: str | None = None
+        if system_instruction and system_instruction.strip():
+            request_data["system_instruction"] = system_instruction
+            system_path = "system_instruction"
 
-        response_data = await self._request_json("POST", INTERACTIONS_ENDPOINT, request_data)
+        try:
+            response_data = await self._request_json("POST", INTERACTIONS_ENDPOINT, request_data)
+        except GeminiVideoError as e:
+            if not (system_path and e.status == 400 and "system_instruction" in str(e).lower()):
+                raise
+            logger.info("[%s] Interactions 拒收 system_instruction，改为内嵌到 input 文本最前面重发", used_model)
+            request_data.pop("system_instruction", None)
+            request_data["input"] = [video_input, {"type": "text", "text": inline_system_text(system_instruction, prompt)}]
+            system_path = "inline"
+            response_data = await self._request_json("POST", INTERACTIONS_ENDPOINT, request_data)
 
         text = _extract_interaction_text(response_data)
         if not text:
@@ -837,4 +909,5 @@ class GeminiVideoClient:
             "truncated": False,
             "channel": "interactions",
             "model": used_model,
+            "system_path": system_path,
         }

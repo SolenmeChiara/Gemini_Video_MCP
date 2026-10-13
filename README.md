@@ -9,8 +9,10 @@ already been battle-tested.
 
 Gemini is *really* good at describing video — good enough that it tends to get dramatic and lyrical
 about it. The default prompt in this server **deliberately leaves that flourish in** (it doesn't ask
-for dry, objective summaries) and asks Gemini to write the description **in Chinese**. If you want a
-flatter tone or a different output language, pass your own `prompt`.
+for dry, objective summaries) and asks Gemini to write the description **in Chinese**. The template
+and its four hard rules travel in the API's system-instruction field; your `prompt` is only appended
+after the video as extra requirements (e.g. "focus on the audio only"), so it can steer focus and
+format without dropping the rules.
 
 ## Tools at a glance
 
@@ -18,7 +20,7 @@ flatter tone or a different output language, pass your own `prompt`.
   - Supports common containers: `mp4 / mov / webm / avi / mkv / flv / wmv / mpeg / mpg / m4v / 3gp / 3gpp`;
   - **Also handles `.gif` natively** (sent as raw `image/gif`, so Gemini perceives the full animation instead of a single extracted frame);
   - Small videos (≤14MB) go inline in a single request; larger ones automatically go through the Files API (upload → wait until ready → describe → delete the remote copy when done), up to a 2GB per-file limit;
-  - `low_resolution` is a cost-saving switch; `persona` lets Gemini narrate in character; `hint` lets you feed in what a human already thinks the video is about, useful for abstract or meme-y content (the model is instructed to still describe what it actually sees, not just agree with you); `prompt` fully overrides the built-in template.
+  - `prompt` adds extra requirements or context (what a human thinks the video is, what to focus on); it is appended after the built-in template, never replaces it, and the model is told to go by what it actually sees and hears. `hint` is a deprecated alias of `prompt`. `low_resolution` sends `mediaResolution=LOW`, which on Gemini 3/4 is the same tier as the default (70 tokens/frame), so it barely changes cost there.
   - `model` (optional, also on `describe_video_url` / `estimate_cost`) picks a Gemini model for this call by its model identifier; empty = `GEMINI_MODEL`. A value with `*` is matched against `models.list` and used only if exactly one model matches. Paid-only models (`GEMINI_PAID_ONLY_MODELS`) skip the free key. The footer names the model that answered.
 - **`describe_video_url`** — downloads a video from a **direct link** and runs it through the same pipeline (downloaded to a temp folder, deleted right after).
   - Same parameters as `describe_video`, just `path` becomes `url`;
@@ -252,9 +254,8 @@ total). The stdio/local mode does **not** expose this endpoint.
 ## Example usage (in conversation)
 
 - "Describe the video at `D:/videos/monkey.mp4` for me" → triggers `describe_video`.
-- "Narrate `D:/videos/dance.mp4` like a snarky high schooler" → Claude passes a `persona`.
 - "This video is people playing five-in-a-row with eggs, describe `D:/videos/eggs.mp4`" → Claude puts
-  your description into `hint` so the model can make sense of something abstract or meme-y.
+  your description into `prompt` so the model can make sense of something abstract or meme-y.
 - "Describe this direct video link: `https://example.com/clip.mp4`" → triggers `describe_video_url`
   (downloads, then describes).
 - "Show me what `D:/videos/monkey.mp4` looks like at the 8-second mark" → triggers `view_media` (pulls
@@ -285,7 +286,7 @@ slice (always static in this mode).
 
 - Times can be seconds (`39`) or `m:ss` (`1:06`); with only `start`, it looks 30 seconds ahead;
   `fps` defaults to 1 and is capped at 10;
-- If `hint` reads like a question (ends with a question mark or contains a question word), the model
+- If `prompt` reads like a question (ends with a question mark or contains a question word), the model
   answers that question about the slice; otherwise it walks through the slice second by second,
   covering actions, sounds and on-screen text;
 - Timestamps in the answer still refer to the original video's timeline.
@@ -308,7 +309,9 @@ Gemini charges input tokens by video duration:
 | Standard (default) | ~**300 tokens/sec** | ~**18k** input tokens | More visual detail |
 | Low-res (`low_resolution=True`) | ~**100 tokens/sec** | ~**6k** input tokens | Cheaper for long videos, coarser detail |
 
-These figures are **input** tokens only; output tokens are billed separately depending on how long the
+These are the classic figures. Per Google's media-resolution docs, Gemini 3/4 tokenize video frames at
+70 tokens/frame for default/low/medium and 280 only at high, so on the default model a minute measures
+closer to ~6–7k input tokens either way (a 50 s clip measured ~5.7k on 3.8-flash). These figures are **input** tokens only; output tokens are billed separately depending on how long the
 description ends up being. Run `estimate_cost` before sending a large video if you want to know what
 you're in for.
 
@@ -322,7 +325,9 @@ This server defaults to `thinking_level=high` (empirically, more thinking produc
 prose) and correspondingly defaults `max_output_tokens` to 8192 to leave room for it; if truncation is
 detected, a note is appended to the result. To save money, set `GEMINI_THINKING_LEVEL=minimal` in
 `.env` (thinking tokens are billed as output tokens). If the model doesn't support the configured
-thinking level, the server automatically retries once at `low`.
+thinking level, the server automatically retries once at `low`. Gemini 4 Argon and 3.8 Flash only
+offer `low/medium/high`, so `minimal` is sent as `low` for them. Sampling parameters
+(`temperature/topK/topP`) are only sent to models older than 3.5; newer ones ignore them.
 
 ## Known limitations
 

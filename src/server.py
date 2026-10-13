@@ -172,7 +172,11 @@ _VIEW_MAX_DIMENSION = 4096
 #   ③ 降解读、升描述——少讲文字“意味着什么”，多讲它长什么样、怎么出现、与画面声音怎么配合；
 #   ④ 禁止静默省略——实测 3.1 Pro 会把看不清、拿不准的元素直接跳过不提（省略无需标注、零风险），
 #      故要求不确定内容必须带不确定度写出（疑似 X / 无法辨认 + 物理特征），不许从描述里消失。
-# 原文两处重复的编号“6.”这里顺手改成 6 / 7；两行人设占位符改由 persona 参数按需插入。
+# 原文两处重复的编号“6.”这里顺手改成 6 / 7；原版的两行人设占位符已删除（不再支持 persona）。
+#
+# 这些固定文字整体放进 API 的系统指令字段（generateContent 的 systemInstruction /
+# Interactions 的 system_instruction），调用方的 prompt（额外要求）只追加在用户回合里、视频之后，
+# 永远不会替换掉模板与四条硬规则。
 
 _DEFAULT_PROMPT_HEAD = (
     '请观看这个视频，并将其"翻译"成文字，让它成为一个就连只支持文字的llm也能'
@@ -203,24 +207,16 @@ _DEFAULT_PROMPT_RULES = """以下四条是硬规则，优先于上面的任何�
 请用中文书写描述（引用的原文除外），结果要详细准确。"""
 
 
-def _build_default_prompt(persona: str | None, hint: str | None = None) -> str:
-    """拼出默认提示词；传了 persona 就在开头位置附体一行人设，传了 hint 就注入人类观看者的前置线索。
+# 调用方额外要求的常驻规则（原 hint 措辞改写）：放在系统指令里，有没有额外要求都一样。
+_EXTRA_REQUIREMENT_RULE = """关于调用方的额外要求：用户消息里视频之后的文字，是调用方给出的额外要求或背景描述（比如人类观看者对这个视频的形容、想重点关注的方面）。它可以作为理解视频的线索（尤其当画面或声音比较抽象、难以直接归类时）；如果它收窄了关注范围或指定了写法，就按它来，上面的描述清单相应让位。但无论如何请以你实际看到、听到的内容为准，不要为了迎合这些要求或形容而虚构不存在的细节；下面四条硬规则始终有效。"""
 
-    末尾固定追加四条硬规则（知识边界 / 原文照录不翻译 / 多描述少解读 / 禁止静默省略），
-    放在最后是为了让它们压过前面的描述清单与人设——实测里模型更容易服从最后读到的约束。
+
+def _build_default_system() -> str:
+    """默认模式的系统指令：开头说明 + 七个方面 + 额外要求的常驻规则 + 四条硬规则。
+
+    硬规则放在最后，是为了让它们压过前面的描述清单——实测里模型更容易服从最后读到的约束。
     """
-    segments = [_DEFAULT_PROMPT_HEAD]
-    if persona:
-        segments.append(f"你的人设是：{persona.strip()}")
-    if hint:
-        segments.append(
-            f"观看前的已知信息：人类观看者对这个视频的形容是：「{hint.strip()}」。\n"
-            "这可以作为理解视频的线索（尤其当画面或声音比较抽象、难以直接归类时），"
-            "但请以你实际看到、听到的内容为准，不要为了迎合这个形容而虚构不存在的细节。"
-        )
-    segments.append(_DEFAULT_PROMPT_BODY)
-    segments.append(_DEFAULT_PROMPT_RULES)
-    # 用空行分隔各段，还原原版排版观感。
+    segments = (_DEFAULT_PROMPT_HEAD, _DEFAULT_PROMPT_BODY, _EXTRA_REQUIREMENT_RULE, _DEFAULT_PROMPT_RULES)
     return "\n\n".join(segments)
 
 
@@ -228,7 +224,7 @@ def _build_default_prompt(persona: str | None, hint: str | None = None) -> str:
 # 「细看」提示词（只看某一段时用；与上面的默认模板并列，不覆盖它）
 # ---------------------------------------------------------------------------
 # 传了 start/end 就说明人已经看过一遍、想回头盯住某几秒，所以这版模板不再要求通篇概览：
-#   - hint 像个问句 -> 就这一段回答这个问题；
+#   - 额外要求像个问句 -> 就这一段回答这个问题；
 #   - 否则 -> 按秒级时间戳把这一段的动作、声音、字幕拆开写。
 # 复用默认模板的四条硬规则（知识边界 / 原文照录不翻译 / 多描述少解读 / 禁止静默省略）。
 
@@ -238,9 +234,7 @@ _DETAIL_PROMPT_HEAD = (
     "回答里出现时间戳时，请用【原视频的绝对时间】（也就是从第 {start} 秒往后数），精确到秒。"
 )
 
-_DETAIL_PROMPT_QUESTION = """人类观看者看过整段视频，现在专门回放这几秒，想弄清楚一件事：
-
-「{question}」
+_DETAIL_PROMPT_QUESTION = """人类观看者看过整段视频，现在专门回放这几秒，想弄清楚一件事，问题写在用户消息里视频之后。
 
 请先直接回答这个问题，答完再补上这一段里与之相关的细节：谁在什么时刻做了什么动作、身体和视线朝向哪里、
 物件怎么移动、画面怎么切换、声音里有什么（说话请逐字照录，也包括笑声、音效、动物叫声、背景音）、
@@ -256,7 +250,7 @@ _DETAIL_PROMPT_DESCRIBE = """请按秒级时间戳把这一段拆开细讲，每
 4. 画面本身：镜头有没有推拉摇晃、有没有剪辑点、光线和构图的变化。"""
 
 
-# agentic 模式专用的提示词尾巴：Interactions 会把模型的"检索计划/自言自语"一并写进 model_output，
+# agentic 模式专用的系统指令尾巴：Interactions 会把模型的"检索计划/自言自语"一并写进 model_output，
 # 实测（gemini-3.8-flash）正文开头会出现"现在对照用户的所有要求：1. …"这类工作笔记。这里直接要求它别写。
 _AGENTIC_PROMPT_SUFFIX = (
     "\n\n（这一次你可以自己决定回看视频的哪几段、用什么帧率、要不要调取音轨。"
@@ -265,25 +259,44 @@ _AGENTIC_PROMPT_SUFFIX = (
 )
 
 
-def _build_detail_prompt(persona: str | None, hint: str | None, start: float, end: float) -> str:
-    """拼出「细看」提示词：hint 像问句就针对这段答题，否则按秒级时间戳细描这一段。"""
+def _build_detail_system(start: float, end: float, question_mode: bool) -> str:
+    """「细看」模式的系统指令：细看说明 + 答题/细描脚手架 + 额外要求的常驻规则 + 四条硬规则。"""
     segments = [_DETAIL_PROMPT_HEAD.format(start=f"{start:g}", end=f"{end:g}")]
-    if persona:
-        segments.append(f"你的人设是：{persona.strip()}")
-
-    question = (hint or "").strip()
-    if question and _looks_like_question(question):
-        segments.append(_DETAIL_PROMPT_QUESTION.format(question=question))
-    else:
-        if question:
-            segments.append(
-                f"观看前的已知信息：人类观看者对这个视频的形容是：「{question}」。"
-                "这只是理解画面的线索，请以你实际看到、听到的为准，不要为了迎合它虚构细节。"
-            )
-        segments.append(_DETAIL_PROMPT_DESCRIBE)
-
+    segments.append(_DETAIL_PROMPT_QUESTION if question_mode else _DETAIL_PROMPT_DESCRIBE)
+    segments.append(_EXTRA_REQUIREMENT_RULE)
     segments.append(_DEFAULT_PROMPT_RULES)
     return "\n\n".join(segments)
+
+
+# 用户回合里视频之后的那段文字。
+_USER_TEXT_DEFAULT = "请解析此视频。"
+_USER_TEXT_DETAIL = "请细看这一段。"
+_USER_TEXT_WITH_EXTRA = "{extra}\n\n请按以上要求解析此视频。"
+_USER_TEXT_DETAIL_WITH_EXTRA = "{extra}\n\n请按以上要求细看这一段。"
+_USER_TEXT_DETAIL_QUESTION = "{extra}\n\n请先直接回答这个问题，再补上这一段里相关的细节。"
+
+
+def _merge_extra(prompt: str | None, hint: str | None) -> str:
+    """prompt 与已弃用的 hint 合进同一个「额外要求」槽：都给了就按 prompt、hint 的顺序空行拼接。"""
+    parts = [x.strip() for x in (prompt, hint) if x and x.strip()]
+    return "\n\n".join(parts)
+
+
+def _build_prompts(extra: str, detail_range: tuple[float, float] | None = None) -> tuple[str, str]:
+    """返回 (系统指令, 用户文字)。额外要求只进用户文字，绝不替换系统指令。"""
+    if detail_range:
+        question_mode = bool(extra) and _looks_like_question(extra)
+        system = _build_detail_system(detail_range[0], detail_range[1], question_mode)
+        if question_mode:
+            user = _USER_TEXT_DETAIL_QUESTION.format(extra=extra)
+        elif extra:
+            user = _USER_TEXT_DETAIL_WITH_EXTRA.format(extra=extra)
+        else:
+            user = _USER_TEXT_DETAIL
+        return system, user
+    system = _build_default_system()
+    user = _USER_TEXT_WITH_EXTRA.format(extra=extra) if extra else _USER_TEXT_DEFAULT
+    return system, user
 
 
 # 疑问句判定用的词表。中文没有词边界，按子串命中即可；英文必须整词命中，
@@ -313,7 +326,7 @@ _QUESTION_AUX_RE = re.compile(r"^(did|does|do|is|are|can)\b")
 
 
 def _looks_like_question(text: str) -> bool:
-    """判断 hint 是不是一个问题：以问号收尾，或含疑问词（英文助动词只认句首）。"""
+    """判断额外要求是不是一个问题：以问号收尾，或含疑问词（英文助动词只认句首）。"""
     stripped = (text or "").strip()
     if not stripped:
         return False
@@ -835,23 +848,16 @@ async def _get_or_upload_file(
 
 def _build_final_prompt_and_tokens(
     prompt: str | None,
-    persona: str | None,
     hint: str | None,
     max_output_tokens: int,
     detail_range: tuple[float, float] | None = None,
-) -> tuple[str, int]:
-    """把 prompt/persona/hint 组装成最终提示词，并把 max_output_tokens 归一化到下限之上。
+) -> tuple[str, str, int]:
+    """组装 (系统指令, 用户文字)，并把 max_output_tokens 归一化到下限之上。
 
-    本地文件、直链下载、YouTube 直读三条入口都共用这一段，确保提示词组装（prompt 优先，
-    其次「细看」模板或 persona/hint 版默认模板）与输出 token 下限保护完全一致、不漂移。
+    本地文件、直链下载、YouTube 直读三条入口都共用这一段，确保提示词组装与输出 token 下限保护不漂移。
+    prompt 与已弃用的 hint 合并成同一个「额外要求」，只追加在用户回合里。
     """
-    # 组装提示词：自定义 prompt 优先；其次「细看」模板（给了 start/end 时）；最后默认模板。
-    if prompt and prompt.strip():
-        final_prompt = prompt.strip()
-    elif detail_range:
-        final_prompt = _build_detail_prompt(persona, hint, detail_range[0], detail_range[1])
-    else:
-        final_prompt = _build_default_prompt(persona, hint)
+    system_text, user_text = _build_prompts(_merge_extra(prompt, hint), detail_range)
 
     # 输出 token 下限保护（思考 token 也计入此上限，太小会把正文挤没）
     try:
@@ -859,7 +865,7 @@ def _build_final_prompt_and_tokens(
     except (TypeError, ValueError):
         tokens = 4096
     effective_tokens = max(tokens, _MIN_OUTPUT_TOKENS)
-    return final_prompt, effective_tokens
+    return system_text, user_text, effective_tokens
 
 
 def _format_describe_result(
@@ -897,6 +903,13 @@ def _format_describe_result(
     return text
 
 
+def _agentic_system_notes(result: dict) -> list[str]:
+    """agentic 结果里若系统指令走了内嵌退路，给页脚一条说明。"""
+    if result.get("system_path") == "inline":
+        return ["Interactions API 拒收了 system_instruction 字段，固定模板已改为内嵌在输入文字最前面。"]
+    return []
+
+
 def _agentic_model(model: str = GEMINI_MODEL) -> str:
     """agentic 路径实际用的模型：调用方换了模型就用它；否则配了 GEMINI_AGENTIC_MODEL 用它，再否则沿用主模型。"""
     if model != GEMINI_MODEL:
@@ -910,6 +923,7 @@ async def _run_static_generate(
     video_bytes: bytes,
     mime_type: str,
     final_prompt: str,
+    system_text: str,
     effective_tokens: int,
     low_resolution: bool,
     file_uri: str | None,
@@ -926,6 +940,7 @@ async def _run_static_generate(
             thinking_level=GEMINI_THINKING_LEVEL,
             file_uri=file_uri,
             video_metadata=video_metadata,
+            system_instruction=system_text,
         )
     except GeminiVideoError as e:
         # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
@@ -941,6 +956,7 @@ async def _run_static_generate(
             thinking_level="low",
             file_uri=file_uri,
             video_metadata=video_metadata,
+            system_instruction=system_text,
         )
 
 
@@ -949,7 +965,6 @@ async def _describe_video_bytes(
     mime_type: str,
     *,
     prompt: str | None,
-    persona: str | None,
     hint: str | None,
     low_resolution: bool,
     max_output_tokens: int,
@@ -973,8 +988,8 @@ async def _describe_video_bytes(
     - key_tier："free" 表示公开内容、先走免费档 key，撞额度/权限时整条换付费档重跑（见 _run_with_key_fallback）。
     - model：已由 _resolve_model 解析好的模型名，本次调用的所有客户端都用它（不改模块全局）。
     """
-    final_prompt, effective_tokens = _build_final_prompt_and_tokens(
-        prompt, persona, hint, max_output_tokens, detail_range
+    system_text, final_prompt, effective_tokens = _build_final_prompt_and_tokens(
+        prompt, hint, max_output_tokens, detail_range
     )
     video_metadata = _build_video_metadata(detail_range[0], detail_range[1], fps) if detail_range else None
 
@@ -1002,12 +1017,14 @@ async def _describe_video_bytes(
         if cur_mode == "agentic" and file_uri:
             try:
                 result = await client.describe_video_agentic(
-                    prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
+                    prompt=final_prompt,
                     file_uri=file_uri,
                     mime_type=mime_type,
                     model=_agentic_model(model),
+                    system_instruction=system_text + _AGENTIC_PROMPT_SUFFIX,
                 )
                 processing = "agentic"
+                notes.extend(_agentic_system_notes(result))
             except GeminiVideoError as e:
                 if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
                     raise
@@ -1020,6 +1037,7 @@ async def _describe_video_bytes(
                 video_bytes=video_bytes,
                 mime_type=mime_type,
                 final_prompt=final_prompt,
+                system_text=system_text,
                 effective_tokens=effective_tokens,
                 low_resolution=low_resolution,
                 file_uri=file_uri,
@@ -1047,7 +1065,6 @@ async def _describe_youtube_url(
     youtube_url: str,
     *,
     prompt: str | None,
-    persona: str | None,
     hint: str | None,
     low_resolution: bool,
     max_output_tokens: int,
@@ -1064,7 +1081,7 @@ async def _describe_youtube_url(
     调用方需自行保证：API key 已存在、youtube_url 已判定为 YouTube 链接。
     key_tier 含义同 _describe_video_bytes（YouTube 公开视频由调用方传 "free"）。
     """
-    final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, persona, hint, max_output_tokens)
+    system_text, final_prompt, effective_tokens = _build_final_prompt_and_tokens(prompt, hint, max_output_tokens)
 
     async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
         client = GeminiVideoClient(api_key=api_key, model=model, base_url=GEMINI_BASE_URL)
@@ -1073,11 +1090,13 @@ async def _describe_youtube_url(
             # YouTube 直读也能进 agentic：uri 直接给视频页链接，不带 mime_type。
             try:
                 result = await client.describe_video_agentic(
-                    prompt=final_prompt + _AGENTIC_PROMPT_SUFFIX,
+                    prompt=final_prompt,
                     file_uri=youtube_url,
                     mime_type=None,
                     model=_agentic_model(model),
+                    system_instruction=system_text + _AGENTIC_PROMPT_SUFFIX,
                 )
+                notes.extend(_agentic_system_notes(result))
                 return result, "agentic", notes
             except GeminiVideoError as e:
                 if tier == "free" and (_is_free_quota_error(e) or _is_overloaded_error(e)):
@@ -1091,6 +1110,7 @@ async def _describe_youtube_url(
                 low_resolution=low_resolution,
                 max_output_tokens=effective_tokens,
                 thinking_level=GEMINI_THINKING_LEVEL,
+                system_instruction=system_text,
             )
         except GeminiVideoError as e:
             # 个别模型不支持当前思考等级（会 400），自动降级为 low 重试一次
@@ -1103,6 +1123,7 @@ async def _describe_youtube_url(
                 low_resolution=low_resolution,
                 max_output_tokens=effective_tokens,
                 thinking_level="low",
+                system_instruction=system_text,
             )
         result.setdefault("model", client.model)
         return result, "static", notes
@@ -1353,7 +1374,6 @@ def _is_youtube_url(url: str) -> bool:
 async def describe_video(
     path: str,
     prompt: str | None = None,
-    persona: str | None = None,
     hint: str | None = None,
     low_resolution: bool = False,
     max_output_tokens: int = 30000,
@@ -1369,16 +1389,11 @@ async def describe_video(
 
     Args:
         path: 本地视频文件的路径（建议用完整绝对路径）。
-        prompt: 自定义提示词。传了就【完全覆盖】默认模板（此时 persona/hint 参数被忽略）。
-            不传则使用内置的“翻译给纯文字 LLM 看”的详细描述模板。
-        persona: 可选的人设。传了会在默认提示词开头附体一行“你的人设是：…”，
-            让 Gemini 以该人格来解说视频。仅在未提供 prompt 时生效。
-        hint: 可选的前置线索——人类观看者对这个视频的形容或背景信息
-            （如“这是在用鸡蛋下五子棋”“声音对应表情包”）。会注入默认模板，
-            帮助模型理解抽象、玩梗类内容；同时要求模型以实际所见为准、不迎合虚构。
-            仅在未提供 prompt 时生效。
-        low_resolution: 低清模式。开启后约 100 token/秒（标清约 300 token/秒），长视频省钱，
-            但画面细节会变粗。默认关闭。
+        prompt: 可选的额外要求或背景描述（如“这是在用鸡蛋下五子棋”“只关注声音”）。只追加在内置模板之后，
+            不会替换模板和它的硬规则；模型仍以实际所见所闻为准，不迎合虚构。
+            细看模式下写成问句就先回答问题。不传则按内置的详细描述模板解析。
+        hint: 已弃用，等同 prompt（两个都传就拼在一起）。
+        low_resolution: 低清模式（mediaResolution=LOW）。新一代模型默认就是这一档，开不开差别很小。默认关闭。
         max_output_tokens: 最大输出 token 数，默认 30000。内部有 2048 的下限保护
             （Gemini 的“思考”token 也计入这里；默认思考等级为 high，思考会占用
             数千 token，太小会把正文挤没。思考等级可用环境变量 GEMINI_THINKING_LEVEL 调整）。
@@ -1453,7 +1468,6 @@ async def describe_video(
         video_bytes,
         mime_type,
         prompt=prompt,
-        persona=persona,
         hint=hint,
         low_resolution=low_resolution,
         max_output_tokens=max_output_tokens,
@@ -1475,7 +1489,6 @@ async def describe_video(
 async def describe_video_url(
     url: str,
     prompt: str | None = None,
-    persona: str | None = None,
     hint: str | None = None,
     low_resolution: bool = False,
     max_output_tokens: int = 30000,
@@ -1494,13 +1507,12 @@ async def describe_video_url(
     ⚠️ B站/抖音/TikTok 等其他平台页面仍不支持（那需要 yt-dlp 之类工具，本服务器暂不支持）。
        若给的是这类平台页面链接、或链接打开是网页而非视频文件，会明确报错。
 
-    其余参数（prompt/persona/hint/low_resolution/max_output_tokens）含义与 describe_video 完全一致。
+    其余参数（prompt/hint/low_resolution/max_output_tokens）含义与 describe_video 完全一致。
 
     Args:
         url: 视频文件的 http/https 直链，或 YouTube 视频页链接（youtube.com/watch、youtu.be、shorts）。
-        prompt: 自定义提示词，传了就完全覆盖默认模板（此时 persona/hint 被忽略）。
-        persona: 可选人设，仅在未传 prompt 时生效。
-        hint: 可选前置线索，仅在未传 prompt 时生效。
+        prompt: 可选的额外要求或背景描述，只追加在内置模板之后、不替换它。
+        hint: 已弃用，等同 prompt。
         low_resolution: 低清省钱开关，默认关闭。
         max_output_tokens: 最大输出 token，默认 30000（内部有 2048 下限保护）。
         mode: 处理方式，含义同 describe_video："auto"（默认，≥5 分钟走 agentic）/"static"/"agentic"。
@@ -1529,7 +1541,6 @@ async def describe_video_url(
         return await _describe_youtube_url(
             url.strip(),
             prompt=prompt,
-            persona=persona,
             hint=hint,
             low_resolution=low_resolution,
             max_output_tokens=max_output_tokens,
@@ -1554,7 +1565,6 @@ async def describe_video_url(
             video_bytes,
             mime_type,
             prompt=prompt,
-            persona=persona,
             hint=hint,
             low_resolution=low_resolution,
             max_output_tokens=max_output_tokens,
