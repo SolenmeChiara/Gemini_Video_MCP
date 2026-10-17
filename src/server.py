@@ -1372,7 +1372,8 @@ def _is_youtube_url(url: str) -> bool:
 
 @mcp.tool(structured_output=False)
 async def describe_video(
-    path: str,
+    path: str | None = None,
+    video_path: str | None = None,
     prompt: str | None = None,
     hint: str | None = None,
     low_resolution: bool = False,
@@ -1389,6 +1390,7 @@ async def describe_video(
 
     Args:
         path: 本地视频文件的路径（建议用完整绝对路径）。
+        video_path: 等同 path 的别名（两个传一个即可，都传时以 path 为准）。
         prompt: 可选的额外要求或背景描述（如“这是在用鸡蛋下五子棋”“只关注声音”）。只追加在内置模板之后，
             不会替换模板和它的硬规则；模型仍以实际所见所闻为准，不迎合虚构。
             细看模式下写成问句就先回答问题。不传则按内置的详细描述模板解析。
@@ -1408,6 +1410,11 @@ async def describe_video(
     Returns:
         Gemini 生成的视频内容描述文本（末尾可能带用量统计或截断提示）。
     """
+    # 0) path / video_path 别名合并（照 hint→prompt 的先例）
+    path = path or video_path
+    if not path:
+        return "缺少视频路径：请传 path（或其别名 video_path），值为本地视频文件的完整路径。"
+
     # 1) API key + 模型
     err = _check_api_key()
     if err:
