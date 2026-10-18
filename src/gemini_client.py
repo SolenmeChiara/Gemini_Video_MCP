@@ -127,10 +127,31 @@ _EXT_TO_MIME: dict[str, str] = {
     # 若被 API 拒绝，请先转成 mp4（见 README「已知限制」）。
     ".mkv": "video/x-matroska",
     ".gif": "image/gif",
+    # 纯音频：MIME 照抄官方 audio 文档的写法（audio/mp3、audio/m4a 等同样是非标准写法）。
+    # .webm / .mpeg 已按视频映射，不在这里重复；纯音频的 webm 用 .weba。
+    ".wav": "audio/wav",
+    ".mp3": "audio/mp3",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".flac": "audio/flac",
+    ".m4a": "audio/m4a",
+    ".opus": "audio/opus",
+    ".weba": "audio/webm",
 }
 
 # 面向用户展示的“支持的格式”清单。
 SUPPORTED_EXTENSIONS = sorted(_EXT_TO_MIME.keys())
+
+# 纯音频后缀：没有画面，view_media 不收、agentic 不走、细看要先在本地剪好（见 describe_video 的说明）。
+AUDIO_EXTENSIONS = frozenset(ext for ext, mime in _EXT_TO_MIME.items() if mime.startswith("audio/"))
+
+
+def is_audio_mime(mime_type: str | None) -> bool:
+    """MIME 是不是纯音频（audio/*）。"""
+    return (mime_type or "").lower().startswith("audio/")
 
 
 class GeminiVideoError(Exception):
@@ -154,7 +175,7 @@ def guess_mime_type(path: str) -> str:
         raise GeminiVideoError(
             f"不支持的文件格式：{suffix or '（无后缀）'}。"
             f"目前支持这些格式：{', '.join(SUPPORTED_EXTENSIONS)}。"
-            "如果你的视频是别的格式，请先用播放器/剪辑软件导出成 mp4 再试。"
+            "如果你的文件是别的格式，请先用播放器/剪辑软件导出成 mp4（视频）或 mp3（音频）再试。"
         )
     return mime
 
@@ -676,6 +697,7 @@ class GeminiVideoClient:
           既不再上传、也【不】删除它（生命周期归调用方管），此时 video_bytes 可以传空字节；
         - video_metadata：只看视频的一段/换抽帧率时传，形如
           {"start_offset": "39s", "end_offset": "46s", "fps": 5}，原样塞进这个 part；
+          实测纯音频 part 上的 offset 会被静默忽略（照整段计费、整段都听），音频片段须由调用方先剪好；
         - low_resolution=True 时发 mediaResolution=LOW；
         - system_instruction：固定模板，走请求体的 systemInstruction；prompt 只是用户回合里视频之后的那段文字。
 

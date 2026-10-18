@@ -15,16 +15,18 @@ Gemini 描述视频的效果非常好——好到会自由发挥出戏剧张力�
 - `describe_video` —— 主工具：**本地**视频 → 文字描述。
   - 支持 `mp4 / mov / webm / avi / mkv / flv / wmv / mpeg / mpg / m4v / 3gp / 3gpp` 等常见视频格式；
   - **也直接支持 `.gif`**（以 `image/gif` 原格式直传，Gemini 能感知完整动画，不抽帧）；
+  - **也收纯音频**（`wav / mp3 / m4a / aac / ogg / oga / flac / opus / aiff / aif / weba`）：只描述声音，恒走 `static`；Gemini 对音频不认 `videoMetadata` 的区间，所以给了 `start`/`end` 时先用 ffmpeg 在本地剪出这一段再发，`fps` 对音频无效；
   - 小视频（≤14MB）内联上传、单次完成；大视频自动走 Files API（上传→等待就绪→识别→用完删除远端文件），单文件上限 2GB；
   - `prompt`：额外要求或背景描述（人类对视频的形容、想重点看什么），只追加在内置模板之后、不替换它，模型仍以实际所见所闻为准；`hint` 是它的弃用别名。`low_resolution` 发 `mediaResolution=LOW`，在 Gemini 3/4 上与默认同档（70 token/帧），基本不省钱。
   - `model`（可选，`describe_video_url` / `estimate_cost` 也有）：本次换哪个 Gemini 模型，填模型识别符，留空用 `GEMINI_MODEL`；带 `*` 的在 `models.list` 里匹配，恰好一个才用。仅付费档的模型（`GEMINI_PAID_ONLY_MODELS`）跳过免费 key。页脚会写明实际作答的模型。
 - `describe_video_url` —— 从**网络直链**下载视频再识别（下载到临时目录、识别完即删）。
   - 参数与 `describe_video` 完全一致，只是把 `path` 换成 `url`；
-  - **只认视频文件直链**（点开就是视频本体、以 `.mp4/.mov/.webm` 等结尾）。视频网站的播放**页面**链接（B站/抖音/TikTok/YouTube 等）**不是直链、不支持解析**（那需要 yt-dlp 之类工具，属未来野心版，本轮不做）；
+  - **只认视频文件直链**（点开就是视频本体、以 `.mp4/.mov/.webm` 等结尾；`.mp3` 等音频直链同样可以）。视频网站的播放**页面**链接（B站/抖音/TikTok/YouTube 等）**不是直链、不支持解析**（那需要 yt-dlp 之类工具，属未来野心版，本轮不做）；
   - 单文件上限 500MB；连接 15 秒 / 总 300 秒超时；遇到网页、非 2xx、超大文件都会给可读中文报错。
 - `view_media` —— 把一张**图片**、或**视频的某一帧**，作为**图片内容**直接返回，让调用方模型（claude 等）**亲眼看到画面**（区别于 `describe_video` 是让 Gemini 看完写文字）。
   - 图片（`png/jpg/jpeg/webp/gif`）：直接返回（长边超过 `max_dimension`（默认 1024，可调范围 16~4096）会等比缩小，不放大）；GIF 只返回**首帧**（整段动画请用 `describe_video`）；
   - 视频：给了 `timestamp`（秒）就抽那一帧，不给则抽**正中间**那一帧；需要本机装了 **ffmpeg**（缺失会中文报错）。
+  - 纯音频没有画面：返回一句提示，请改用 `describe_video`。
 - `estimate_cost` —— 小工具：发大视频前估算大概消耗多少输入 token（优先 ffprobe 读时长，读不到按大小粗估）。
 - `get_upload_url` —— 小工具：拿到"把文件推到本服务器"的上传地址，配合 claude.ai 沙盒把聊天里上传的文件中转过来再识别（见下文「HTTP 模式」）。**本地 stdio 模式下没有上传端点**，调用它会直接告诉你"无需上传，同一台电脑直接传路径即可"。
 
@@ -266,6 +268,7 @@ Gemini 按视频时长计输入 token：
 | --- | --- | --- | --- |
 | 标清（默认） | 约 **300 token/秒** | 约 **1.8 万**输入 token | 画面细节更足 |
 | 低清（`low_resolution=True`） | 约 **100 token/秒** | 约 **0.6 万**输入 token | 长视频省钱，细节变粗 |
+| 纯音频文件 | 约 **32 token/秒** | 约 **1,900** 输入 token | 官方音频速率；`low_resolution` 对音频无效 |
 
 这是旧版数字。按 Google media-resolution 文档，Gemini 3/4 的视频帧在默认/low/medium 下都是 70 token/帧，high 才是 280，所以默认模型上每分钟约 6–7k 输入 token、开不开低清差不多（50 秒片段在 3.8-flash 实测约 5.7k）。以上只是**输入** token；输出 token 另计，取决于描述长短。发大视频前可先用 `estimate_cost` 心里有数。
 

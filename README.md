@@ -19,16 +19,18 @@ format without dropping the rules.
 - **`describe_video`** — the main tool: local video → text description.
   - Supports common containers: `mp4 / mov / webm / avi / mkv / flv / wmv / mpeg / mpg / m4v / 3gp / 3gpp`;
   - **Also handles `.gif` natively** (sent as raw `image/gif`, so Gemini perceives the full animation instead of a single extracted frame);
+  - **Also takes audio-only files** (`wav / mp3 / m4a / aac / ogg / oga / flac / opus / aiff / aif / weba`): described from sound alone and always run `static`. `start`/`end` cut the segment locally with ffmpeg first, because Gemini ignores `videoMetadata` offsets on audio; `fps` is ignored;
   - Small videos (≤14MB) go inline in a single request; larger ones automatically go through the Files API (upload → wait until ready → describe → delete the remote copy when done), up to a 2GB per-file limit;
   - `prompt` adds extra requirements or context (what a human thinks the video is, what to focus on); it is appended after the built-in template, never replaces it, and the model is told to go by what it actually sees and hears. `hint` is a deprecated alias of `prompt`. `low_resolution` sends `mediaResolution=LOW`, which on Gemini 3/4 is the same tier as the default (70 tokens/frame), so it barely changes cost there.
   - `model` (optional, also on `describe_video_url` / `estimate_cost`) picks a Gemini model for this call by its model identifier; empty = `GEMINI_MODEL`. A value with `*` is matched against `models.list` and used only if exactly one model matches. Paid-only models (`GEMINI_PAID_ONLY_MODELS`) skip the free key. The footer names the model that answered.
 - **`describe_video_url`** — downloads a video from a **direct link** and runs it through the same pipeline (downloaded to a temp folder, deleted right after).
   - Same parameters as `describe_video`, just `path` becomes `url`;
-  - **Only works with direct video file links** (something that resolves straight to a video file, ending in `.mp4/.mov/.webm`/etc.). Platform *watch pages* (YouTube, TikTok, Bilibili, etc.) are **not** direct links and won't resolve — that would need something like yt-dlp, which is out of scope for now;
+  - **Only works with direct video file links** (something that resolves straight to a video file, ending in `.mp4/.mov/.webm`/etc.; audio file links such as `.mp3` work too). Platform *watch pages* (YouTube, TikTok, Bilibili, etc.) are **not** direct links and won't resolve — that would need something like yt-dlp, which is out of scope for now;
   - 500MB per-file cap; 15s connect / 300s total timeout; non-video pages, non-2xx responses, and oversized files all get a readable error.
 - **`view_media`** — returns a **picture** (either an image file, or one frame pulled from a video) as actual **image content**, so the calling model (Claude, etc.) can look at it directly — as opposed to `describe_video`, which has Gemini watch the video and write text about it.
   - Images (`png/jpg/jpeg/webp/gif`): returned as-is, downscaled (never upscaled) if the longer side exceeds `max_dimension` (default 1024, adjustable 16–4096). GIFs return only their **first frame** (use `describe_video` if you want the full animation understood);
   - Videos: pass `timestamp` (in seconds) to grab that frame, or omit it to grab the frame at the **midpoint**; requires **ffmpeg** on the host machine (a clear error is returned if it's missing).
+  - Audio files have no picture: they return a short message pointing to `describe_video`.
 - **`estimate_cost`** — a small helper that estimates roughly how many input tokens a video will cost before you send it (uses `ffprobe` for real duration when available, otherwise estimates from file size).
 - **`get_upload_url`** — a small helper that returns the upload endpoint URL so a claude.ai sandbox can push a chat-uploaded file to this server before describing it (see "HTTP mode" below). **Under local stdio mode there is no upload endpoint**, so calling this just returns "not needed — you're on the same machine, pass the local path directly."
 
@@ -308,6 +310,7 @@ Gemini charges input tokens by video duration:
 | --- | --- | --- | --- |
 | Standard (default) | ~**300 tokens/sec** | ~**18k** input tokens | More visual detail |
 | Low-res (`low_resolution=True`) | ~**100 tokens/sec** | ~**6k** input tokens | Cheaper for long videos, coarser detail |
+| Audio-only file | ~**32 tokens/sec** | ~**1.9k** input tokens | Official audio rate; `low_resolution` has no effect |
 
 These are the classic figures. Per Google's media-resolution docs, Gemini 3/4 tokenize video frames at
 70 tokens/frame for default/low/medium and 280 only at high, so on the default model a minute measures

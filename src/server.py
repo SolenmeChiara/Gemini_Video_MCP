@@ -7,7 +7,7 @@
       供 claude.ai（远程 MCP / Custom Connector）或手机远程连接。详见 README「HTTP 模式」一节。
 
 工具（宁少勿多；stdio / HTTP 两模式都可用）：
-    - describe_video：主工具。输入【本地】视频路径，返回按时间轴分段的详细内容描述（画面 + 音轨）。
+    - describe_video：主工具。输入【本地】视频路径，返回按时间轴分段的详细内容描述（画面 + 音轨）；也收纯音频文件。
     - describe_video_url：输入视频文件【直链】，下载到临时目录后走同一条识别管线（用完即删）。
     - view_media：把一张图片、或视频的某一帧，作为【图片内容】直接返回，让调用方模型亲眼看到画面。
     - estimate_cost：小工具。估算发这个视频大概消耗多少输入 token，让人心里有数。
@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,11 +58,13 @@ from .config import (
 )
 from .gemini_client import (
     _EXT_TO_MIME,
+    AUDIO_EXTENSIONS,
     FILES_API_LIMIT_BYTES,
     VIDEO_INLINE_LIMIT_BYTES,
     GeminiVideoClient,
     GeminiVideoError,
     guess_mime_type,
+    is_audio_mime,
 )
 
 # 日志一律走 stderr——stdio 传输下 stdout 是 JSON-RPC 通道，绝不能污染。
@@ -71,11 +74,11 @@ logger = logging.getLogger("gemini-video-mcp")
 # 服务器级 instructions：随 MCP initialize 下发给客户端，让对端模型（如 claude.ai 里的 Claude）
 # 不用人教就知道"聊天里上传的文件怎么搬运到本服务器"。
 _SERVER_INSTRUCTIONS = """本服务器的工具都以【这台服务器所在电脑】上的文件路径为输入。
-如果用户在聊天里上传了视频/图片（它们在你的代码沙盒里，如 /mnt/user-data/uploads/），
+如果用户在聊天里上传了视频/音频/图片（它们在你的代码沙盒里，如 /mnt/user-data/uploads/），
 而不是给出服务器上的路径，请按以下配方把文件搬运过来再识别：
 1. 调用 get_upload_url 工具，拿到上传地址；
 2. 在你的代码沙盒里执行：requests.post(上传地址, files={"file": open("沙盒里的文件路径", "rb")})；
-3. 用响应 JSON 里的 saved_path 调用 describe_video（视频识别）或 view_media（亲眼看画面）。
+3. 用响应 JSON 里的 saved_path 调用 describe_video（视频/音频识别）或 view_media（亲眼看画面）。
 沙盒能访问外网时这条链路才通；失败时把报错如实告诉用户即可。"""
 
 mcp = FastMCP(name="Gemini Video MCP Server", instructions=_SERVER_INSTRUCTIONS)
@@ -90,9 +93,13 @@ _MIN_OUTPUT_TOKENS = 2048
 # token 消耗速率（sol 在 bot 里实测的经验值）：标清约 300/秒，低清约 100/秒。
 _TOKENS_PER_SEC_STANDARD = 300
 _TOKENS_PER_SEC_LOW = 100
+# 纯音频：官方 audio 文档写 32 token/秒（1 分钟 1,920）；low_resolution 对音频不起作用。
+_TOKENS_PER_SEC_AUDIO = 32
 
 # 无法读到时长时，按文件大小粗估时长用的假设码率（约 1.5 Mbps）。
 _ASSUMED_BYTES_PER_SEC = 1_500_000 / 8  # ≈ 187500 B/s ≈ 0.18 MB/s
+# 音频同理，按约 128 kbps 粗估。
+_ASSUMED_AUDIO_BYTES_PER_SEC = 128_000 / 8
 
 # ---------------------------------------------------------------------------
 # 远程文件通道基建常量（describe_video_url 下载 + --http 上传端点共用；stdio 本地识别不涉及）
@@ -125,6 +132,25 @@ _CONTENT_TYPE_TO_MIME: dict[str, str] = {
     "video/3gpp": "video/3gpp",
     "video/x-matroska": "video/x-matroska",
     "image/gif": "image/gif",
+    # 纯音频：映射到官方 audio 文档的写法。
+    "audio/wav": "audio/wav",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/mp3": "audio/mp3",
+    "audio/mpeg": "audio/mp3",
+    "audio/aiff": "audio/aiff",
+    "audio/x-aiff": "audio/aiff",
+    "audio/aac": "audio/aac",
+    "audio/x-aac": "audio/aac",
+    "audio/ogg": "audio/ogg",
+    "audio/flac": "audio/flac",
+    "audio/x-flac": "audio/flac",
+    "audio/mp4": "audio/m4a",
+    "audio/m4a": "audio/m4a",
+    "audio/x-m4a": "audio/m4a",
+    "audio/opus": "audio/opus",
+    "audio/webm": "audio/webm",
 }
 
 # ---------------------------------------------------------------------------
@@ -154,8 +180,8 @@ _UPLOAD_CACHE_LOCK = asyncio.Lock()
 
 # view_media 相关：图片/视频后缀集合与缩放边长的合理区间。
 _VIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-# 视频后缀 = 识别支持的全部后缀去掉 .gif（gif 归到图片一侧，取首帧）。
-_VIEW_VIDEO_EXTS = {ext for ext in _EXT_TO_MIME if ext != ".gif"}
+# 视频后缀 = 识别支持的全部后缀去掉 .gif（gif 归到图片一侧，取首帧）和纯音频（没有画面可看）。
+_VIEW_VIDEO_EXTS = {ext for ext in _EXT_TO_MIME if ext != ".gif" and ext not in AUDIO_EXTENSIONS}
 _VIEW_MIN_DIMENSION = 16
 _VIEW_MAX_DIMENSION = 4096
 
@@ -211,12 +237,26 @@ _DEFAULT_PROMPT_RULES = """以下四条是硬规则，优先于上面的任何�
 _EXTRA_REQUIREMENT_RULE = """关于调用方的额外要求：用户消息里视频之后的文字，是调用方给出的额外要求或背景描述（比如人类观看者对这个视频的形容、想重点关注的方面）。它可以作为理解视频的线索（尤其当画面或声音比较抽象、难以直接归类时）；如果它收窄了关注范围或指定了写法，就按它来，上面的描述清单相应让位。但无论如何请以你实际看到、听到的内容为准，不要为了迎合这些要求或形容而虚构不存在的细节；下面四条硬规则始终有效。"""
 
 
-def _build_default_system() -> str:
+# 纯音频输入时紧跟在开头说明后面的一句话（模板本身不改）。
+_AUDIO_ONLY_NOTE = (
+    "（本次输入是一段纯音频，没有画面：上面和下面凡是涉及画面、镜头、屏幕文字的要求都请略过，"
+    "把描述的力气全部放在声音上。）"
+)
+# 纯音频「细看」：音频 part 不吃 videoMetadata 的 offset，服务器先在本地把这一段剪出来再发。
+_AUDIO_DETAIL_NOTE = (
+    "（本次输入是一段纯音频，没有画面；它已在本地剪成只含这一段，你听到的第 0 秒就是原音频的第 {start} 秒。"
+    "写时间戳时请把你听到的时刻加上 {start} 秒，换算成原音频的时间。涉及画面、镜头、屏幕文字的要求都请略过。）"
+)
+
+
+def _build_default_system(audio: bool = False) -> str:
     """默认模式的系统指令：开头说明 + 七个方面 + 额外要求的常驻规则 + 四条硬规则。
 
     硬规则放在最后，是为了让它们压过前面的描述清单——实测里模型更容易服从最后读到的约束。
+    audio=True 时在开头说明后面插一句「纯音频」提示。
     """
-    segments = (_DEFAULT_PROMPT_HEAD, _DEFAULT_PROMPT_BODY, _EXTRA_REQUIREMENT_RULE, _DEFAULT_PROMPT_RULES)
+    head = [_DEFAULT_PROMPT_HEAD, _AUDIO_ONLY_NOTE] if audio else [_DEFAULT_PROMPT_HEAD]
+    segments = (*head, _DEFAULT_PROMPT_BODY, _EXTRA_REQUIREMENT_RULE, _DEFAULT_PROMPT_RULES)
     return "\n\n".join(segments)
 
 
@@ -259,9 +299,14 @@ _AGENTIC_PROMPT_SUFFIX = (
 )
 
 
-def _build_detail_system(start: float, end: float, question_mode: bool) -> str:
-    """「细看」模式的系统指令：细看说明 + 答题/细描脚手架 + 额外要求的常驻规则 + 四条硬规则。"""
+def _build_detail_system(start: float, end: float, question_mode: bool, audio: bool = False) -> str:
+    """「细看」模式的系统指令：细看说明 + 答题/细描脚手架 + 额外要求的常驻规则 + 四条硬规则。
+
+    audio=True 表示输入是本地剪好的纯音频片段：插一句说明，让模型把听到的时刻加上起点换算成原音频时间。
+    """
     segments = [_DETAIL_PROMPT_HEAD.format(start=f"{start:g}", end=f"{end:g}")]
+    if audio:
+        segments.append(_AUDIO_DETAIL_NOTE.format(start=f"{start:g}"))
     segments.append(_DETAIL_PROMPT_QUESTION if question_mode else _DETAIL_PROMPT_DESCRIBE)
     segments.append(_EXTRA_REQUIREMENT_RULE)
     segments.append(_DEFAULT_PROMPT_RULES)
@@ -270,8 +315,10 @@ def _build_detail_system(start: float, end: float, question_mode: bool) -> str:
 
 # 用户回合里视频之后的那段文字。
 _USER_TEXT_DEFAULT = "请解析此视频。"
+_USER_TEXT_DEFAULT_AUDIO = "请解析此音频。"
 _USER_TEXT_DETAIL = "请细看这一段。"
 _USER_TEXT_WITH_EXTRA = "{extra}\n\n请按以上要求解析此视频。"
+_USER_TEXT_WITH_EXTRA_AUDIO = "{extra}\n\n请按以上要求解析此音频。"
 _USER_TEXT_DETAIL_WITH_EXTRA = "{extra}\n\n请按以上要求细看这一段。"
 _USER_TEXT_DETAIL_QUESTION = "{extra}\n\n请先直接回答这个问题，再补上这一段里相关的细节。"
 
@@ -282,11 +329,11 @@ def _merge_extra(prompt: str | None, hint: str | None) -> str:
     return "\n\n".join(parts)
 
 
-def _build_prompts(extra: str, detail_range: tuple[float, float] | None = None) -> tuple[str, str]:
-    """返回 (系统指令, 用户文字)。额外要求只进用户文字，绝不替换系统指令。"""
+def _build_prompts(extra: str, detail_range: tuple[float, float] | None = None, audio: bool = False) -> tuple[str, str]:
+    """返回 (系统指令, 用户文字)。额外要求只进用户文字，绝不替换系统指令。audio=True 时系统指令带纯音频提示。"""
     if detail_range:
         question_mode = bool(extra) and _looks_like_question(extra)
-        system = _build_detail_system(detail_range[0], detail_range[1], question_mode)
+        system = _build_detail_system(detail_range[0], detail_range[1], question_mode, audio)
         if question_mode:
             user = _USER_TEXT_DETAIL_QUESTION.format(extra=extra)
         elif extra:
@@ -294,8 +341,11 @@ def _build_prompts(extra: str, detail_range: tuple[float, float] | None = None) 
         else:
             user = _USER_TEXT_DETAIL
         return system, user
-    system = _build_default_system()
-    user = _USER_TEXT_WITH_EXTRA.format(extra=extra) if extra else _USER_TEXT_DEFAULT
+    system = _build_default_system(audio)
+    if audio:
+        user = _USER_TEXT_WITH_EXTRA_AUDIO.format(extra=extra) if extra else _USER_TEXT_DEFAULT_AUDIO
+    else:
+        user = _USER_TEXT_WITH_EXTRA.format(extra=extra) if extra else _USER_TEXT_DEFAULT
     return system, user
 
 
@@ -380,15 +430,21 @@ def _parse_time_value(value: float | str | None) -> tuple[float | None, str | No
     return seconds, None
 
 
-def _resolve_mode(mode: str | None, duration: float | None) -> tuple[str, str | None]:
+def _resolve_mode(mode: str | None, duration: float | None, audio: bool = False) -> tuple[str, str | None]:
     """决定这次走 static 还是 agentic。
 
     Returns:
         (模式, 给页脚的说明或 None)。auto 时按时长分流；读不到时长一律 static。
+        纯音频恒走 static（agentic 的 Interactions 输入是 video 类型，自主取帧对音频没有意义；
+        音频本来就便宜，几十分钟也只要几万 token）；显式要 agentic 时页脚注明。
     """
     raw = (mode or "auto").strip().lower()
     if raw not in ("auto", "static", "agentic"):
         return "static", f"mode 值「{mode}」无法识别（可用：auto / static / agentic），已按 static 处理。"
+    if audio:
+        if raw == "agentic":
+            return "static", "agentic（模型自己挑片段、定帧率）只适用于视频，纯音频已按 static 整段处理。"
+        return "static", None
     if raw != "auto":
         return raw, None
     if duration and duration >= _AGENTIC_AUTO_MIN_DURATION_SEC:
@@ -851,13 +907,14 @@ def _build_final_prompt_and_tokens(
     hint: str | None,
     max_output_tokens: int,
     detail_range: tuple[float, float] | None = None,
+    audio: bool = False,
 ) -> tuple[str, str, int]:
     """组装 (系统指令, 用户文字)，并把 max_output_tokens 归一化到下限之上。
 
     本地文件、直链下载、YouTube 直读三条入口都共用这一段，确保提示词组装与输出 token 下限保护不漂移。
-    prompt 与已弃用的 hint 合并成同一个「额外要求」，只追加在用户回合里。
+    prompt 与已弃用的 hint 合并成同一个「额外要求」，只追加在用户回合里。audio=True 时系统指令带纯音频提示。
     """
-    system_text, user_text = _build_prompts(_merge_extra(prompt, hint), detail_range)
+    system_text, user_text = _build_prompts(_merge_extra(prompt, hint), detail_range, audio)
 
     # 输出 token 下限保护（思考 token 也计入此上限，太小会把正文挤没）
     try:
@@ -985,13 +1042,18 @@ async def _describe_video_bytes(
     - mode="agentic"：Interactions API，模型自己决定看哪段、什么帧率（需要先上传到 Files API）；
       跑不通时自动回退 static，并把原因写进页脚。
     - detail_range/fps：只看某一段（「细看」），走 videoMetadata，恒定 static。
+      纯音频（mime 为 audio/*）不吃 videoMetadata（实测 offset 被静默忽略），所以音频带 detail_range 时
+      约定 video_bytes 已是调用方在本地剪好的那一段：这里不发 videoMetadata，只用区间组装提示词和页脚。
     - key_tier："free" 表示公开内容、先走免费档 key，撞额度/权限时整条换付费档重跑（见 _run_with_key_fallback）。
     - model：已由 _resolve_model 解析好的模型名，本次调用的所有客户端都用它（不改模块全局）。
     """
+    audio = is_audio_mime(mime_type)
     system_text, final_prompt, effective_tokens = _build_final_prompt_and_tokens(
-        prompt, hint, max_output_tokens, detail_range
+        prompt, hint, max_output_tokens, detail_range, audio
     )
-    video_metadata = _build_video_metadata(detail_range[0], detail_range[1], fps) if detail_range else None
+    video_metadata = (
+        _build_video_metadata(detail_range[0], detail_range[1], fps) if detail_range and not audio else None
+    )
 
     async def _run(api_key: str, tier: str) -> tuple[dict, str, list[str]]:
         # 每档 key 各跑一遍完整流程（上传 → agentic/static），notes 与 mode 都从头算，免得回退残留串档。
@@ -1045,8 +1107,9 @@ async def _describe_video_bytes(
             )
             processing = "static"
             if detail_range:
-                fps_note = f"，fps={fps:g}" if fps else ""
-                processing = f"static（细看 {detail_range[0]:g}s–{detail_range[1]:g}s{fps_note}）"
+                fps_note = f"，fps={fps:g}" if fps and not audio else ""
+                cut_note = "，本地剪段" if audio else ""
+                processing = f"static（细看 {detail_range[0]:g}s–{detail_range[1]:g}s{fps_note}{cut_note}）"
         result.setdefault("model", client.model)
         return result, processing, notes
 
@@ -1370,6 +1433,43 @@ def _is_youtube_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _ffmpeg_cut_audio_blocking(path: str, start: float, end: float) -> tuple[bytes | None, str | None]:
+    """用 ffmpeg 把音频的 [start, end) 剪成 FLAC 字节（纯音频「细看」用）。阻塞函数，调用方丢线程池。
+
+    音频 part 不吃 videoMetadata 的 offset（实测静默忽略、整段计费、整段都听），只能先在本地剪好再发。
+    统一重编码成 16kHz 单声道 FLAC：ffmpeg 内置编码器、任何输入容器都能出；Gemini 本来就会把音频
+    降到 16kHz 并混成单声道，按原规格编码只会让体积膨胀到原文件几倍。写临时文件而不是管道，
+    免得 FLAC 头里的总长度回填不了；临时文件落 temp_media/，读完即删。
+
+    Returns (flac_bytes, None) 或 (None, 中文错误)。
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None, "本机没有找到 ffmpeg，无法剪出这一段音频。请先安装 ffmpeg 后重试，或去掉 start/end 整段识别。"
+    dest: Path | None = None
+    try:
+        _ensure_temp_media_dir()
+        dest = _resolve_in_temp_media(_safe_temp_name(f"audio_cut_{uuid.uuid4().hex[:8]}.flac"))
+        cmd = [
+            ffmpeg, "-nostdin", "-v", "error", "-y",
+            "-ss", f"{start:.3f}", "-i", path, "-t", f"{end - start:.3f}",
+            "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-c:a", "flac", str(dest),
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+        if result.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+            errmsg = (result.stderr or b"").decode("utf-8", "replace").strip()[:300]
+            return None, f"ffmpeg 没能剪出这一段音频（可能区间超出时长或文件损坏）。\nffmpeg 说明：{errmsg or '无'}"
+        return dest.read_bytes(), None
+    except (subprocess.SubprocessError, OSError, GeminiVideoError) as e:
+        return None, f"剪出音频片段时出错：{e}"
+    finally:
+        if dest is not None:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @mcp.tool(structured_output=False)
 async def describe_video(
     path: str | None = None,
@@ -1387,9 +1487,11 @@ async def describe_video(
     """把本地视频交给 Gemini 直传识别，返回按时间轴分段的详细内容描述（画面 + 音轨）。
 
     支持 mp4/mov/webm/avi/mkv 等常见视频格式，也直接支持 .gif（以原格式感知完整动画，不抽帧）。
+    也支持纯音频（mp3/wav/m4a/flac/aac/ogg/opus/aiff 等）：只描述声音，恒走 static；
+    给了 start/end 时先用本机 ffmpeg 剪出这一段再发（音频不认 videoMetadata 的区间），fps 对音频无效。
 
     Args:
-        path: 本地视频文件的路径（建议用完整绝对路径）。
+        path: 本地视频（或音频）文件的路径（建议用完整绝对路径）。
         video_path: 等同 path 的别名（两个传一个即可，都传时以 path 为准）。
         prompt: 可选的额外要求或背景描述（如“这是在用鸡蛋下五子棋”“只关注声音”）。只追加在内置模板之后，
             不会替换模板和它的硬规则；模型仍以实际所见所闻为准，不迎合虚构。
@@ -1461,14 +1563,27 @@ async def describe_video(
     duration = await asyncio.to_thread(_probe_duration_blocking, str(p))
 
     # 7) 「细看」参数 + 处理模式
+    is_audio = is_audio_mime(mime_type)
     detail_range, fps_value, err = _resolve_detail_range(start, end, fps, duration)
     if err:
         return err
     if detail_range:
         # 只看一段时恒定走 static：agentic 的自主取帧与"只喂这几秒"是两套思路，不叠加。
         resolved_mode, mode_note = "static", None
+        if is_audio:
+            # 音频 part 不吃 videoMetadata 的 offset：先在本地剪出这一段（FLAC），只把这一段发出去。
+            cut_bytes, err = await asyncio.to_thread(
+                _ffmpeg_cut_audio_blocking, str(p), detail_range[0], detail_range[1]
+            )
+            if err:
+                return err
+            assert cut_bytes is not None
+            video_bytes, mime_type = cut_bytes, "audio/flac"
+            if fps_value:
+                mode_note = "音频没有画面，fps（抽帧率）已忽略。"
+                fps_value = None
     else:
-        resolved_mode, mode_note = _resolve_mode(mode, duration)
+        resolved_mode, mode_note = _resolve_mode(mode, duration, is_audio)
 
     # 8) 交给共享识别管线（组装提示词 + 调 Gemini + 拼装返回文本）
     return await _describe_video_bytes(
@@ -1506,7 +1621,7 @@ async def describe_video_url(
 
     两种输入都支持：
     - 视频文件直链（以 .mp4/.mov/.webm 等结尾、点开就是视频本体）：下载到服务器 temp_media/ 临时目录，
-      识别完就删掉。
+      识别完就删掉。音频直链（.mp3/.wav/.m4a 等）同样可以，按纯音频处理（恒走 static）。
     - ✅ YouTube 视频页链接（youtube.com/watch、youtu.be 短链、shorts 等）可以直接传，服务器不下载、
       由 Gemini 云端直读；仅支持公开视频（私享/会员/年龄限制的不行），免费层每天有 YouTube 总时长限额，
       长视频照常按秒计费。
@@ -1567,7 +1682,7 @@ async def describe_video_url(
         if not video_bytes:
             return "下载到的文件是空的（0 字节），请确认这个直链有效。"
         duration = await asyncio.to_thread(_probe_duration_blocking, str(temp_path))
-        resolved_mode, mode_note = _resolve_mode(mode, duration)
+        resolved_mode, mode_note = _resolve_mode(mode, duration, is_audio_mime(mime_type))
         return await _describe_video_bytes(
             video_bytes,
             mime_type,
@@ -1641,9 +1756,10 @@ async def estimate_cost(path: str, model: str = "") -> str:
     """估算把某个本地视频交给 Gemini 识别大概要花多少输入 token，让你发大视频前心里有数。
 
     优先用 ffprobe 读真实时长；读不到（没装 ffprobe / 格式怪）则按文件大小粗估并注明。
+    纯音频按官方约 32 token/秒估算（low_resolution 对音频无效）。
 
     Args:
-        path: 本地视频文件路径。
+        path: 本地视频（或音频）文件路径。
         model: 可选，打算用哪个模型（写法同 describe_video 的 model）；只用来在结果里标明模型与付费档，
             token 估算本身不随模型变（单价因模型而异）。
 
@@ -1669,39 +1785,50 @@ async def estimate_cost(path: str, model: str = "") -> str:
     try:
         size_bytes = p.stat().st_size
         size_mb = size_bytes / 1024 / 1024
+        is_audio = is_audio_mime(mime_type)
 
         duration = await asyncio.to_thread(_probe_duration_blocking, str(p))
         if duration is not None and duration > 0:
             duration_note = f"时长：约 {duration:.1f} 秒（{duration / 60:.1f} 分钟，ffprobe 实测）"
             est_source = "实测时长"
         else:
-            duration = max(size_bytes / _ASSUMED_BYTES_PER_SEC, 0.1)
+            assumed_rate, rate_label = (
+                (_ASSUMED_AUDIO_BYTES_PER_SEC, "~128kbps") if is_audio else (_ASSUMED_BYTES_PER_SEC, "~1.5Mbps")
+            )
+            duration = max(size_bytes / assumed_rate, 0.1)
             duration_note = (
                 f"时长：约 {duration:.1f} 秒（{duration / 60:.1f} 分钟，"
-                "⚠️ 未能读到真实时长，按 ~1.5Mbps 码率由文件大小粗估，仅供参考）"
+                f"⚠️ 未能读到真实时长，按 {rate_label} 码率由文件大小粗估，仅供参考）"
             )
             est_source = "粗估时长"
-
-        tokens_standard = duration * _TOKENS_PER_SEC_STANDARD
-        tokens_low = duration * _TOKENS_PER_SEC_LOW
 
         is_gif = mime_type == "image/gif"
         channel = "inline 内联（单次请求）" if size_bytes <= VIDEO_INLINE_LIMIT_BYTES else "Files API（先上传再识别）"
 
         lines = [
-            f"视频费用预估：{p.name}",
+            f"{'音频' if is_audio else '视频'}费用预估：{p.name}",
             f"文件大小：{size_mb:.1f} MB（{size_bytes:,} 字节）",
             duration_note,
             f"上传通道：{channel}（内联阈值 14MB）",
             f"模型：{resolved_model}" + ("（仅付费档，不走免费 key）" if _is_paid_only_model(resolved_model) else ""),
             "",
             f"输入 token 估算（基于{est_source}）：",
-            f"  - 标清（约 300 token/秒）：{_fmt_tokens(tokens_standard)}",
-            f"  - 低清（约 100 token/秒，low_resolution=True）：{_fmt_tokens(tokens_low)}",
-            "",
-            "说明：以上是【输入】token 估算，不含模型输出 token（取决于描述长短）。",
-            "参考：标清约 300 token/秒，1 分钟视频约 1.8 万输入 token。长视频建议开 low_resolution 省钱。",
         ]
+        if is_audio:
+            lines += [
+                f"  - 纯音频（约 {_TOKENS_PER_SEC_AUDIO} token/秒）：{_fmt_tokens(duration * _TOKENS_PER_SEC_AUDIO)}",
+                "",
+                "说明：以上是【输入】token 估算，不含模型输出 token（取决于描述长短）。",
+                "参考：音频按官方约 32 token/秒计，1 分钟约 1,920 输入 token；low_resolution 对音频无效。",
+            ]
+        else:
+            lines += [
+                f"  - 标清（约 300 token/秒）：{_fmt_tokens(duration * _TOKENS_PER_SEC_STANDARD)}",
+                f"  - 低清（约 100 token/秒，low_resolution=True）：{_fmt_tokens(duration * _TOKENS_PER_SEC_LOW)}",
+                "",
+                "说明：以上是【输入】token 估算，不含模型输出 token（取决于描述长短）。",
+                "参考：标清约 300 token/秒，1 分钟视频约 1.8 万输入 token。长视频建议开 low_resolution 省钱。",
+            ]
         if is_gif:
             lines.append("注：这是 GIF，以原格式直传、通常没有音轨，token 估算仅作上限参考。")
         return "\n".join(lines)
@@ -1914,6 +2041,7 @@ async def view_media(path: str, timestamp: float | None = None, max_dimension: i
       没给则返回【拼图网格】：时长 <60s 等距 9 帧（3×3），≥60s 等距 12 帧（横屏 3列×4行、竖屏 4列×3行），
       取样避开首尾各 2%，每格左上角烫时间戳，并附一行「从左到右、从上到下对应秒数」清单。
       网格是 JPEG、不受 max_dimension 控制。先看网格定位，再用 timestamp 抽感兴趣那一刻的大图。需要本机有 ffmpeg。
+    - path 是纯音频（mp3/wav/m4a 等）：没有画面，直接返回一句说明，请改用 describe_video。
 
     与 describe_video 的分工：describe_video 让 Gemini 看视频写【文字】；view_media 把【画面本身】投给
     你（调用方模型）看。stdio / HTTP 模式都可用。
@@ -1958,6 +2086,9 @@ async def view_media(path: str, timestamp: float | None = None, max_dimension: i
                 logger.warning("view_media 缩放失败，退回原图：%s", ferr)
                 return Image(path=str(p))
             return Image(data=data, format="png")
+
+        if suffix in AUDIO_EXTENSIONS:
+            return "音频文件没有画面，view_media 看不了。想知道里面的声音内容，请用 describe_video。"
 
         if suffix in _VIEW_VIDEO_EXTS:
             seek = timestamp
